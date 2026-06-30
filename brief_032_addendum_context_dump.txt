@@ -1,0 +1,694 @@
+===== api\routes\goals.py =====
+# PATH: stride_backend/api/routes/goals.py
+# DOMAIN: Goal creation and management API routes — Flow 1
+
+from __future__ import annotations
+
+import graphlib
+from datetime import date, datetime, timezone
+from math import floor
+from typing import Dict, List, Optional
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from agents.drafting_agent.agent import DraftingAgent
+from agents.smart_agent.agent import SmartAgent
+from agents.task_decomposer.agent import TaskDecomposer
+from api.dependencies import (
+    get_drafting_agent,
+    get_distilled_store,
+    get_goal_store,
+    get_onboarding_store,
+    get_raw_store,
+    get_scheduling_component,
+    get_smart_agent,
+    get_task_decomposer,
+)
+from core.config import DEEP_MIN_GAP_DAYS
+from core.scheduling.scheduling_component import SchedulingComponent
+from core.scheduling.tri_vector import compute_tri_vector_weights, derive_corridor
+from core.schemas.contracts.execution_engine import (
+    MilestoneAllocationData,
+    SlotAllocationInput,
+)
+from core.schemas.contracts.goal_drafting import (
+    DraftingInput,
+    DraftingOutput,
+    DraftingRevisionInput,
+)
+from core.schemas.contracts.goal_structuring import Boundary1Input
+from core.schemas.contracts.task_decomposition import TaskDecompositionInput
+from core.schemas.entities import (
+    Goal,
+    Milestone,
+    MilestoneStatus,
+    Task,
+    TaskStatus,
+)
+from core.schemas.enums import GoalStatus, TaskTag
+from storage.distilled_store import DistilledStore
+from storage.goal_store import GoalStore
+from storage.onboarding_store import OnboardingStore
+from storage.raw_store import RawStore
+
+router = APIRouter(prefix="/goals", tags=["goals"])
+
+
+# ── Request / Response models ──────────────────────────────────────────────────
+
+class DraftGoalRequest(BaseModel):
+    user_id: str
+    raw_goal: str
+    user_context: str
+
+
+class ReviseGoalDraftRequest(BaseModel):
+    user_id: str
+    previous_draft: dict
+    user_response: str
+
+
+class StructureGoalRequest(BaseModel):
+    user_id: str
+    confirmed_draft: dict
+    existing_goal_summaries: List[dict] = []
+
+
+class NegotiateStructureRequest(BaseModel):
+    user_id: str
+    confirmed_draft: dict
+    previous_assessment: dict
+    user_response: str
+    existing_goal_summaries: List[dict] = []
+
+
+class ConfirmGoalRequest(BaseModel):
+    user_id: str
+    confirmed_draft: dict
+    smart_assessment: dict          # Boundary1Output as dict
+    week_start: str                 # ISO date string
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _resolve_dependencies(tasks: List[Task]) -> List[Task]:
+    """
+    Map dependency descriptions to task_ids using TopologicalSorter.
+    Returns tasks with dependencies resolved to task_ids.
+    Raises HTTPException 400 if cycle detected.
+    """
+    desc_to_id = {t.description: t.task_id for t in tasks}
+
+    # Build dependency map using task_ids
+    dep_map: Dict[str, List[str]] = {}
+    for task in tasks:
+        resolved = []
+        for dep_desc in task.dependencies:
+            dep_id = desc_to_id.get(dep_desc)
+            if dep_id:
+                resolved.append(dep_id)
+        dep_map[task.task_id] = resolved
+        task.dependencies = resolved
+
+    # Validate — detect cycles
+    try:
+        sorter = graphlib.TopologicalSorter(dep_map)
+        sorter.prepare()
+    except graphlib.CycleError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Dependency cycle detected in task graph: {e}",
+        )
+
+    # Mark tasks with no unmet deps as AVAILABLE
+    tasks_with_deps = {tid for deps in dep_map.values() for tid in deps}
+    for task in tasks:
+        if not task.dependencies:
+            task.status = TaskStatus.AVAILABLE
+        else:
+            task.status = TaskStatus.PENDING
+
+    return tasks
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+
+@router.post("/draft")
+async def draft_goal(
+    request: DraftGoalRequest,
+    drafting_agent: DraftingAgent = Depends(get_drafting_agent),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+):
+    """
+    Flow 1 Step 1 — DraftingAgent converts raw goal text into structured draft.
+    """
+    snapshot_result = distilled_store.get_model(request.user_id)
+    snapshot = snapshot_result.data.model_dump() if snapshot_result.success else {}
+
+    drafting_input = DraftingInput(
+        user_id=request.user_id,
+        raw_goal=request.raw_goal,
+        user_context=request.user_context,
+        distilled_model_snapshot=snapshot,
+    )
+
+    output = await drafting_agent.draft_goal(drafting_input)
+
+    if output.error:
+        raise HTTPException(status_code=500, detail=output.error.message)
+
+    return output.model_dump()
+
+
+@router.post("/draft/revise")
+async def revise_goal_draft(
+    request: ReviseGoalDraftRequest,
+    drafting_agent: DraftingAgent = Depends(get_drafting_agent),
+):
+    """
+    Flow 1 — DraftingAgent revises draft based on user feedback.
+    """
+    previous_draft = DraftingOutput(**request.previous_draft)
+
+    revision_input = DraftingRevisionInput(
+        user_id=request.user_id,
+        previous_draft=previous_draft,
+        user_response=request.user_response,
+    )
+
+    output = await drafting_agent.revise_draft(revision_input)
+
+    if output.error:
+        raise HTTPException(status_code=500, detail=output.error.message)
+
+    return output.model_dump()
+
+
+@router.post("/structure")
+async def structure_goal(
+    request: StructureGoalRequest,
+    smart_agent: SmartAgent = Depends(get_smart_agent),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+):
+    """
+    Flow 1 Step 2 — SmartAgent fits confirmed draft to user context.
+    Returns SMART formulation, impact_score, extracted_deadline.
+    """
+    snapshot_result = distilled_store.get_model(request.user_id)
+    snapshot = snapshot_result.data.model_dump() if snapshot_result.success else {}
+
+    boundary_input = Boundary1Input(
+        user_id=request.user_id,
+        confirmed_draft=request.confirmed_draft,
+        distilled_model_snapshot=snapshot,
+        existing_goal_summaries=request.existing_goal_summaries,
+    )
+
+    output = await smart_agent.structure_goal(boundary_input)
+
+    if output.error:
+        raise HTTPException(status_code=500, detail=output.error.message)
+
+    return output.model_dump()
+
+
+@router.post("/structure/negotiate")
+async def negotiate_goal_structure(
+    request: NegotiateStructureRequest,
+    smart_agent: SmartAgent = Depends(get_smart_agent),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+):
+    """
+    Flow 1 — SmartAgent negotiates SMART formulation on user pushback.
+    """
+    snapshot_result = distilled_store.get_model(request.user_id)
+    snapshot = snapshot_result.data.model_dump() if snapshot_result.success else {}
+
+    boundary_input = Boundary1Input(
+        user_id=request.user_id,
+        confirmed_draft=request.confirmed_draft,
+        distilled_model_snapshot=snapshot,
+        existing_goal_summaries=request.existing_goal_summaries,
+    )
+
+    output = await smart_agent.negotiate_goal_creation(
+        input=boundary_input,
+        previous_assessment=request.previous_assessment,
+        user_response=request.user_response,
+    )
+
+    if output.error:
+        raise HTTPException(status_code=500, detail=output.error.message)
+
+    return output.model_dump()
+
+
+@router.post("/confirm")
+async def confirm_goal(
+    request: ConfirmGoalRequest,
+    task_decomposer: TaskDecomposer = Depends(get_task_decomposer),
+    scheduling_component: SchedulingComponent = Depends(get_scheduling_component),
+    goal_store: GoalStore = Depends(get_goal_store),
+    raw_store: RawStore = Depends(get_raw_store),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+    onboarding_store: OnboardingStore = Depends(get_onboarding_store),
+):
+    """
+    Flow 1 Step 3 — Confirm goal. Writes Goal + Milestones, runs TaskDecomposer,
+    runs SchedulingComponent, writes Tasks.
+    """
+    smart = request.smart_assessment
+    draft = request.confirmed_draft
+
+    # ── Capacity conflict check ────────────────────────────────────────────────
+    onboarding_result = onboarding_store.get_profile(request.user_id)
+    if not onboarding_result.success:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No OnboardingProfile found for this user. "
+                "Complete onboarding (POST /onboarding/profile) before "
+                "confirming a goal."
+            ),
+        )
+    max_workable_hours = onboarding_result.data.max_workable_hours
+
+    # ── Build Goal entity ──────────────────────────────────────────────────────
+    extracted_deadline = smart.get("extracted_deadline")
+    if not extracted_deadline:
+        raise HTTPException(
+            status_code=400,
+            detail="extracted_deadline is required to confirm a goal.",
+        )
+
+    goal_id = str(uuid4())
+    goal = Goal(
+        goal_id=goal_id,
+        user_id=request.user_id,
+        name=smart.get("smart_formulation", {}).get("specific", "Unnamed Goal"),
+        status=GoalStatus.ACTIVE,
+        macro_impact=smart.get("impact_score", 3),
+        terminal_deadline=date.fromisoformat(extracted_deadline),
+    )
+
+    # ── Build Milestone entities (V=1.0 placeholder) ───────────────────────────
+    proposed_milestones = draft.get("proposed_milestones", [])
+    milestones: List[Milestone] = []
+    for pm in proposed_milestones:
+        milestones.append(Milestone(
+            milestone_id=str(uuid4()),
+            goal_id=goal_id,
+            user_id=request.user_id,
+            description=pm.get("description", ""),
+            objectives=pm.get("objectives", []),
+            success_metrics=draft.get("success_metrics", []),
+            tri_vector_weight=0.0,      # placeholder — computed after tasks
+            min_weekly_units=0,
+            max_weekly_units=0,
+            status=MilestoneStatus.STAGED,
+        ))
+
+    # ── Write Goal and Milestones ──────────────────────────────────────────────
+    goal_write = goal_store.upsert_goal(goal)
+    if not goal_write.success:
+        raise HTTPException(status_code=500, detail=goal_write.error.message)
+
+    for m in milestones:
+        m_write = goal_store.upsert_milestone(m)
+        if not m_write.success:
+            raise HTTPException(status_code=500, detail=m_write.error.message)
+
+    # ── Run TaskDecomposer per milestone ───────────────────────────────────────
+    task_graphs: Dict[str, List[Task]] = {}
+    for m in milestones:
+        decomp_input = TaskDecompositionInput(
+            milestone_id=m.milestone_id,
+            milestone_description=m.description,
+            objectives=m.objectives,
+            success_metrics=m.success_metrics,
+            previous_task_logs=[],
+        )
+        decomp_output = await task_decomposer.decompose(decomp_input)
+        if decomp_output.error:
+            raise HTTPException(
+                status_code=500, detail=decomp_output.error.message
+            )
+
+        # Build Task entities from drafts
+        tasks = [
+            Task(
+                task_id=str(uuid4()),
+                milestone_id=m.milestone_id,
+                goal_id=goal_id,
+                user_id=request.user_id,
+                description=td.description,
+                tag=td.tag,
+                dependencies=list(td.dependencies),
+                status=TaskStatus.PENDING,
+            )
+            for td in decomp_output.tasks
+        ]
+
+        # Resolve dependencies
+        tasks = _resolve_dependencies(tasks)
+        task_graphs[m.milestone_id] = tasks
+
+    # ── Recompute Tri-Vector with real V ───────────────────────────────────────
+    # Single-goal call: goals_by_id contains only this goal, so normalization
+    # scope is identical to pre-Brief-030 behavior. See
+    # core/scheduling/tri_vector.py for the cross-goal weekly-cycle call site.
+    weights = compute_tri_vector_weights(milestones, {goal.goal_id: goal}, task_graphs)
+
+    for m in milestones:
+        w = weights[m.milestone_id]
+        min_u, max_u = derive_corridor(w, max_workable_hours)
+        m.tri_vector_weight = w
+        m.min_weekly_units = min_u
+        m.max_weekly_units = max_u
+        m.status = MilestoneStatus.ACTIVE
+        goal_store.upsert_milestone(m)
+
+    # ── Write Tasks ────────────────────────────────────────────────────────────
+    for task_list in task_graphs.values():
+        for task in task_list:
+            t_write = goal_store.upsert_task(task)
+            if not t_write.success:
+                raise HTTPException(
+                    status_code=500, detail=t_write.error.message
+                )
+
+    # ── Run SchedulingComponent ────────────────────────────────────────────────
+    week_start = date.fromisoformat(request.week_start)
+
+    slot_grid_result = onboarding_store.get_slot_grid(request.user_id, week_start)
+    if not slot_grid_result.success:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No SlotGrid found for user {request.user_id}, week "
+                f"{week_start.isoformat()}. Onboarding may be incomplete, "
+                f"or this week's grid has not been generated."
+            ),
+        )
+    slot_grid = slot_grid_result.data
+
+    allocation_input = SlotAllocationInput(
+        user_id=request.user_id,
+        week_start=week_start,
+        milestones=[
+            MilestoneAllocationData(
+                milestone_id=m.milestone_id,
+                tri_vector_weight=m.tri_vector_weight,
+                min_weekly_units=m.min_weekly_units,
+                max_weekly_units=m.max_weekly_units,
+            )
+            for m in milestones
+        ],
+        slot_grid=slot_grid.model_dump(),
+        notes="goal confirmation",
+    )
+
+    allocation_output = scheduling_component.allocate_slots(allocation_input)
+
+    if allocation_output.error:
+        # Non-fatal — log and continue. Scheduling failure should not
+        # block goal creation.
+        pass
+
+    return {
+        "goal_id": goal_id,
+        "milestone_ids": [m.milestone_id for m in milestones],
+        "task_counts": {
+            mid: len(tasks) for mid, tasks in task_graphs.items()
+        },
+        "deep_session_plans": (
+            [p.model_dump() for p in allocation_output.deep_session_plans]
+            if not allocation_output.error else []
+        ),
+        "status": "confirmed",
+    }
+
+
+===== core\scheduling\tri_vector.py =====
+# PATH: stride_backend/core/scheduling/tri_vector.py
+# DOMAIN: Single source of truth for Tri-Vector weight computation
+# (I × U × V, normalized) and corridor derivation. Extracted from
+# api/routes/goals.py (Brief 030, Section 5.1) so that confirm_goal
+# (single-goal call site) and the weekly cycle (cross-goal call site)
+# share one implementation instead of two.
+#
+# Signature note: compute_tri_vector_weights takes goals_by_id (a dict,
+# not a single Goal) so I/U are looked up per-milestone via its own
+# parent goal, while avg_units and the final normalization are computed
+# across the ENTIRE milestones list passed in — whatever scope the
+# caller provides. confirm_goal passes only one goal's own milestones
+# (goals_by_id = {goal.goal_id: goal}), reproducing the exact pre-Brief-030
+# single-goal normalization. The weekly cycle passes every active
+# milestone across every active goal for a user, achieving correct
+# cross-goal normalization per the architecture doc's "Σ(W_raw across all
+# ACTIVE milestones) = 1.0" rule.
+
+from __future__ import annotations
+
+from datetime import date
+from typing import Dict, List
+
+from core.config import FLOOR_FACTOR, SLOT_UNIT_CONSTANTS, URGENCY_BRACKETS
+from core.schemas.entities import Goal, Milestone, Task
+
+
+def compute_urgency(deadline: date) -> float:
+    days_remaining = (deadline - date.today()).days
+    for threshold, multiplier in URGENCY_BRACKETS:
+        if days_remaining < threshold:
+            return multiplier
+    return 1.0
+
+
+def compute_tri_vector_weights(
+    milestones: List[Milestone],
+    goals_by_id: Dict[str, Goal],
+    task_graphs: Dict[str, List[Task]],
+) -> Dict[str, float]:
+    """
+    Compute normalized tri_vector_weight for each milestone in `milestones`.
+    I = parent goal's macro_impact (looked up via goals_by_id[m.goal_id])
+    U = urgency multiplier from the parent goal's terminal_deadline
+    V = slot units this milestone / avg slot units across ALL milestones
+        passed in this call
+
+    Normalization is global across the full `milestones` list — callers
+    control scope by what they pass in (one goal's milestones, or every
+    active milestone across every goal).
+
+    A milestone whose goal_id isn't found in goals_by_id is skipped
+    (not raised) — defensive, matches the dangling-reference skip
+    convention in core/aggregation/consumed_units.py.
+    """
+    slot_units: Dict[str, int] = {}
+    for m in milestones:
+        tasks = task_graphs.get(m.milestone_id, [])
+        total = sum(SLOT_UNIT_CONSTANTS.get(t.tag, 1) for t in tasks)
+        slot_units[m.milestone_id] = total if total > 0 else 1
+
+    avg_units = sum(slot_units.values()) / len(slot_units) if slot_units else 1.0
+
+    raw_weights: Dict[str, float] = {}
+    for m in milestones:
+        goal = goals_by_id.get(m.goal_id)
+        if goal is None:
+            continue
+        I = goal.macro_impact
+        U = compute_urgency(goal.terminal_deadline)
+        V = slot_units[m.milestone_id] / avg_units
+        raw_weights[m.milestone_id] = I * U * V
+
+    total = sum(raw_weights.values()) or 1.0
+    return {mid: w / total for mid, w in raw_weights.items()}
+
+
+def derive_corridor(
+    normalized_weight: float,
+    max_workable_hours: float,
+) -> tuple[int, int]:
+    weekly_units = round(max_workable_hours * 2.4)
+    min_units = round(normalized_weight * weekly_units * FLOOR_FACTOR)
+    max_units = round(normalized_weight * weekly_units)
+    return max(min_units, 1), max(max_units, 1)
+
+
+===== storage\onboarding_store.py =====
+# PATH: stride_backend/storage/onboarding_store.py
+# DOMAIN: TinyDB persistence for OnboardingProfile and SlotGrid.
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, date
+from enum import Enum
+from typing import Any
+
+from tinydb import TinyDB, Query
+
+from core.schemas.entities import OnboardingProfile, SlotGrid
+from storage.store_types import StoreError, StoreResult
+
+_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class OnboardingStore:
+    def __init__(self, db: TinyDB) -> None:
+        self._profiles = db.table("onboarding_profiles")
+        self._grids = db.table("slot_grids")
+
+    def _serialise(self, data: Any) -> Any:
+        if isinstance(data, datetime):
+            return data.isoformat()
+        if isinstance(data, date):
+            return data.isoformat()
+        if isinstance(data, Enum):
+            return data.value
+        if isinstance(data, dict):
+            return {k: self._serialise(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._serialise(item) for item in data]
+        return data
+
+    def _deserialise(self, data: Any) -> Any:
+        if isinstance(data, str) and _ISO_RE.match(data):
+            try:
+                return datetime.fromisoformat(data)
+            except ValueError:
+                return data
+        if isinstance(data, str) and _DATE_RE.match(data):
+            try:
+                return date.fromisoformat(data)
+            except ValueError:
+                return data
+        if isinstance(data, dict):
+            return {k: self._deserialise(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._deserialise(item) for item in data]
+        return data
+
+    # ── Profile methods ──────────────────────────────────────────────────
+
+    def get_profile(self, user_id: str) -> StoreResult[OnboardingProfile]:
+        try:
+            Q = Query()
+            doc = self._profiles.get(Q.user_id == user_id)
+            if doc is None:
+                return StoreResult(
+                    success=False,
+                    error=StoreError(
+                        code="NOT_FOUND",
+                        message=f"No OnboardingProfile for user {user_id}",
+                        operation="get_profile",
+                    ),
+                )
+            profile = OnboardingProfile(**self._deserialise(dict(doc)))
+            return StoreResult(success=True, data=profile)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(code="READ_ERROR", message=str(e), operation="get_profile"),
+            )
+
+    def upsert_profile(self, profile: OnboardingProfile) -> StoreResult[None]:
+        try:
+            serialised = self._serialise(profile.model_dump())
+            Q = Query()
+            self._profiles.upsert(serialised, Q.user_id == profile.user_id)
+            return StoreResult(success=True, data=None)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(code="WRITE_ERROR", message=str(e), operation="upsert_profile"),
+            )
+
+    # ── SlotGrid methods ─────────────────────────────────────────────────
+
+    def get_slot_grid(self, user_id: str, week_start: date) -> StoreResult[SlotGrid]:
+        try:
+            Q = Query()
+            doc = self._grids.get(
+                (Q.user_id == user_id) & (Q.week_start == week_start.isoformat())
+            )
+            if doc is None:
+                return StoreResult(
+                    success=False,
+                    error=StoreError(
+                        code="NOT_FOUND",
+                        message=f"No SlotGrid for user {user_id}, week {week_start.isoformat()}",
+                        operation="get_slot_grid",
+                    ),
+                )
+            grid = SlotGrid(**self._deserialise(dict(doc)))
+            return StoreResult(success=True, data=grid)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(code="READ_ERROR", message=str(e), operation="get_slot_grid"),
+            )
+
+    def upsert_slot_grid(self, grid: SlotGrid) -> StoreResult[None]:
+        try:
+            serialised = self._serialise(grid.model_dump())
+            Q = Query()
+            self._grids.upsert(
+                serialised,
+                (Q.user_id == grid.user_id) & (Q.week_start == grid.week_start.isoformat()),
+            )
+            return StoreResult(success=True, data=None)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(code="WRITE_ERROR", message=str(e), operation="upsert_slot_grid"),
+            )
+
+
+===== core\schemas\enums.py =====
+from enum import Enum
+
+
+class TaskTag(str, Enum):
+    DEEP = "DEEP"               # 4 slot units = 100 minutes
+    MODERATE = "MODERATE"       # 2 slot units = 50 minutes
+    MECHANICAL = "MECHANICAL"   # 1 slot unit  = 25 minutes
+
+
+class TaskStatus(str, Enum):
+    PENDING = "PENDING"         # blocked by unmet dependencies
+    AVAILABLE = "AVAILABLE"     # dependencies met, ready for pull
+    COMPLETED = "COMPLETED"
+    SUPERSEDED = "SUPERSEDED"   # replaced by breakdown tasks
+
+
+class MilestoneStatus(str, Enum):
+    DRAFT = "DRAFT"
+    STAGED = "STAGED"           # approved, waiting for capacity or epoch boundary
+    ACTIVE = "ACTIVE"
+    COMPLETED = "COMPLETED"
+
+
+class GoalStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    PAUSED = "PAUSED"
+    COMPLETED = "COMPLETED"
+
+
+class EnergyLevel(str, Enum):
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+
+
+class SelfEfficacyLevel(str, Enum):
+    LOW = "low"
+    MODERATE = "moderate"
+    HIGH = "high"
+
+

@@ -1,0 +1,512 @@
+===== core\schemas\entities.py =====
+from __future__ import annotations
+from datetime import date, datetime
+from typing import List, Optional
+from pydantic import BaseModel, Field, field_validator
+
+from core.schemas.enums import (
+    TaskTag, TaskStatus, MilestoneStatus, GoalStatus, EnergyLevel
+)
+
+
+# ─────────────────────────────────────────────
+# GOAL
+# ─────────────────────────────────────────────
+
+class Goal(BaseModel):
+    goal_id: str
+    user_id: str
+    name: str
+    status: GoalStatus = GoalStatus.ACTIVE
+    macro_impact: int               # 1–5, cascades to child milestones as I
+    terminal_deadline: date         # Python uses this to compute U
+    schema_version: int = 2
+
+
+# ─────────────────────────────────────────────
+# MILESTONE
+# ─────────────────────────────────────────────
+
+class Milestone(BaseModel):
+    milestone_id: str
+    goal_id: str
+    user_id: str
+    description: str
+    objectives: List[str] = Field(default_factory=list)
+    success_metrics: List[str] = Field(default_factory=list)
+    tri_vector_weight: float = 0.0          # computed by Python, not LLM
+    min_weekly_units: int = 0               # floor — derived from weight
+    max_weekly_units: int = 0               # ceiling — derived from weight
+    status: MilestoneStatus = MilestoneStatus.DRAFT
+    schema_version: int = 2
+
+
+# ─────────────────────────────────────────────
+# TASK
+# ─────────────────────────────────────────────
+
+class Task(BaseModel):
+    task_id: str
+    milestone_id: str
+    goal_id: str
+    user_id: str
+    description: str
+    tag: TaskTag
+    dependencies: List[str] = Field(default_factory=list)  # list of task_ids
+    status: TaskStatus = TaskStatus.PENDING
+    stalled_flag: bool = False
+    schema_version: int = 2
+
+    # NOTE: No slot_units field. Slot cost derived at runtime:
+    # MECHANICAL=1, MODERATE=2, DEEP=4 (from config.SLOT_UNIT_CONSTANTS)
+
+
+# ─────────────────────────────────────────────
+# SLOT GRID
+# ─────────────────────────────────────────────
+
+class TimeSlot(BaseModel):
+    day: str                        # e.g. "Monday"
+    start_time: str                 # e.g. "09:00"
+    energy_level: EnergyLevel
+
+
+class SlotGrid(BaseModel):
+    user_id: str
+    week_start: date
+    slots: List[TimeSlot] = Field(default_factory=list)
+    schema_version: int = 1
+
+    # NOTE: SlotGrid holds NO task IDs.
+    # It is an energy index — describes the user's week, not their schedule.
+
+
+# ─────────────────────────────────────────────
+# ONBOARDING PROFILE
+# ─────────────────────────────────────────────
+
+class EnergyBlock(BaseModel):
+    label: str                  # user-defined free text, e.g. "morning", "post-lunch slump"
+    start_time: str             # "HH:MM" 24hr format
+    end_time: str               # "HH:MM" 24hr format, must be > start_time
+    energy_level: EnergyLevel   # HIGH | MEDIUM | LOW
+
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def validate_time_format(cls, v: str) -> str:
+        import re
+        if not re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", v):
+            raise ValueError(f"Invalid HH:MM time format: {v}")
+        return v
+
+
+class OnboardingProfile(BaseModel):
+    user_id: str
+    max_workable_hours: float                   # hard weekly cap
+    weekday_blocks: List[EnergyBlock]            # applied Mon-Fri
+    weekend_blocks: List[EnergyBlock]            # applied Sat-Sun. Client sends
+                                                  # matching blocks for both if user
+                                                  # wants no weekday/weekend difference
+                                                  # — this is a user decision, not a
+                                                  # system default. Never silently
+                                                  # duplicated server-side.
+    schema_version: int = 3
+
+
+# ─────────────────────────────────────────────
+# RAW STORE ENTITIES
+# ─────────────────────────────────────────────
+
+class FeedbackEvent(BaseModel):
+    id: str
+    task_id: str
+    goal_id: str
+    milestone_id: str
+    user_id: str
+    completed_at: datetime
+    note: Optional[str] = None
+    significance_check_triggered: bool = False
+    schema_version: int = 1
+
+
+class PhaseTransition(BaseModel):
+    id: str
+    goal_id: str
+    user_id: str
+    from_status: str
+    to_status: str
+    transitioned_at: datetime
+    reason: str
+    schema_version: int = 1
+
+
+class RawUserModel(BaseModel):
+    user_id: str
+    feedback_events: List[FeedbackEvent] = Field(default_factory=list)
+    phase_transitions: List[PhaseTransition] = Field(default_factory=list)
+    last_updated: datetime
+    schema_version: int = 1
+
+
+# ─────────────────────────────────────────────
+# DISTILLED STORE ENTITIES
+# ─────────────────────────────────────────────
+
+class PriorityEntry(BaseModel):
+    goal_id: str
+    goal_name: str
+    weight: float                   # tri_vector_weight — used for ordering
+    schema_version: int = 1
+
+
+class PriorityList(BaseModel):
+    user_id: str
+    ranked_goals: List[PriorityEntry] = Field(default_factory=list)
+    last_updated: datetime
+    schema_version: int = 1
+
+
+class DistilledModel(BaseModel):
+    user_id: str
+    notes: Optional[str] = None     # free-form coaching notes from weekly guidance
+    distillation_version: int = 0   # incremented on each write
+    last_distilled_at: Optional[datetime] = None
+    schema_version: int = 1
+
+
+===== api\routes\tasks.py =====
+# PATH: stride_backend/api/routes/tasks.py
+# DOMAIN: Task execution routes — pull and complete
+
+from __future__ import annotations
+
+from typing import Dict, Optional
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from agents.model_agent.executor import ModelAgentExecutor
+from api.dependencies import (
+    get_distilled_store,
+    get_goal_store,
+    get_raw_store,
+    get_slot_allocator,
+)
+from core.config import SLOT_UNIT_CONSTANTS
+from core.execution.slot_allocator import SlotAllocator
+from core.feedback.feedback_loop import FeedbackLoop
+from core.schemas.contracts.execution_engine import (
+    MilestoneAllocationData,
+    QueuePullRequest,
+)
+from core.schemas.contracts.feedback_loop import Boundary3Input
+from core.schemas.enums import EnergyLevel, TaskStatus, TaskTag
+from storage.distilled_store import DistilledStore
+from storage.goal_store import GoalStore
+from storage.raw_store import RawStore
+
+router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+# ── Request / Response models ──────────────────────────────────────────────────
+
+class PullTaskRequest(BaseModel):
+    user_id: str
+    current_energy_level: str          # "HIGH" | "MEDIUM" | "LOW"
+    last_task_tag: Optional[str] = None
+    last_milestone_id: Optional[str] = None
+    consecutive_pull_count: int = 0
+    force_pull: bool = False
+
+
+class CompleteTaskRequest(BaseModel):
+    user_id: str
+    task_id: str
+    goal_id: str
+    milestone_id: str
+    completion_timestamp: Optional[str] = None
+    user_note: Optional[str] = None
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _get_consumed_units(
+    user_id: str,
+    goal_store: GoalStore,
+    raw_store: RawStore,
+) -> Dict[str, int]:
+    """
+    Compute consumed_units per milestone for the current week
+    from completed tasks in GoalStore.
+    """
+    tasks_result = goal_store.get_tasks_by_user(user_id)
+    if not tasks_result.success:
+        return {}
+
+    consumed: Dict[str, int] = {}
+    for task in tasks_result.data:
+        if task.status == TaskStatus.COMPLETED:
+            units = SLOT_UNIT_CONSTANTS.get(task.tag, 1)
+            consumed[task.milestone_id] = consumed.get(task.milestone_id, 0) + units
+
+    return consumed
+
+
+def _get_milestone_allocation_data(
+    user_id: str,
+    goal_store: GoalStore,
+) -> list[MilestoneAllocationData]:
+    """
+    Fetch all ACTIVE milestones and return as MilestoneAllocationData list.
+    """
+    result = goal_store.get_active_milestones_by_user(user_id)
+    if not result.success:
+        return []
+
+    return [
+        MilestoneAllocationData(
+            milestone_id=m.milestone_id,
+            tri_vector_weight=m.tri_vector_weight,
+            min_weekly_units=m.min_weekly_units,
+            max_weekly_units=m.max_weekly_units,
+        )
+        for m in result.data
+    ]
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+
+@router.post("/pull")
+async def pull_task(
+    request: PullTaskRequest,
+    goal_store: GoalStore = Depends(get_goal_store),
+    raw_store: RawStore = Depends(get_raw_store),
+    slot_allocator: SlotAllocator = Depends(get_slot_allocator),
+):
+    """
+    Flow 2 — Pull next task for the user based on current energy level
+    and client-held execution state.
+    """
+    # Validate energy level
+    try:
+        energy = EnergyLevel(request.current_energy_level.upper())
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid energy level: {request.current_energy_level}",
+        )
+
+    # Parse last_task_tag
+    last_tag = None
+    if request.last_task_tag:
+        try:
+            last_tag = TaskTag(request.last_task_tag.upper())
+        except ValueError:
+            pass
+
+    # Build pull request
+    pull_request = QueuePullRequest(
+        user_id=request.user_id,
+        current_energy_level=energy,
+        last_task_tag=last_tag,
+        last_milestone_id=request.last_milestone_id,
+        consecutive_pull_count=request.consecutive_pull_count,
+        force_pull=request.force_pull,
+    )
+
+    # Fetch active tasks and milestone data
+    active_tasks_result = goal_store.get_available_tasks_by_user(request.user_id)
+    active_tasks = active_tasks_result.data if active_tasks_result.success else []
+
+    milestone_data = _get_milestone_allocation_data(request.user_id, goal_store)
+    consumed_units = _get_consumed_units(request.user_id, goal_store, raw_store)
+
+    # Run SlotAllocator
+    response = slot_allocator.pull(
+        request=pull_request,
+        active_tasks=active_tasks,
+        milestone_data=milestone_data,
+        consumed_units=consumed_units,
+    )
+
+    if response.error:
+        raise HTTPException(status_code=500, detail=response.error.message)
+
+    return {
+        "pulled_task": (
+            response.pulled_task.model_dump()
+            if response.pulled_task else None
+        ),
+        "state_message": response.state_message,
+    }
+
+
+@router.post("/complete")
+async def complete_task(
+    request: CompleteTaskRequest,
+    goal_store: GoalStore = Depends(get_goal_store),
+    raw_store: RawStore = Depends(get_raw_store),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+):
+    """
+    Flow 3 — Mark task as complete. Writes FeedbackEvent, updates task status.
+    """
+    # Verify task exists
+    task_result = goal_store.get_task(request.task_id)
+    if not task_result.success:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Task {request.task_id} not found.",
+        )
+
+    # Package completion event
+    feedback_loop = FeedbackLoop()
+    boundary_input = feedback_loop.package_completion_event(
+        user_id=request.user_id,
+        task_id=request.task_id,
+        goal_id=request.goal_id,
+        milestone_id=request.milestone_id,
+        completion_timestamp=request.completion_timestamp,
+        user_note=request.user_note,
+    )
+
+    # Process via ModelAgentExecutor
+    executor = ModelAgentExecutor(
+        raw_store=raw_store,
+        distilled_store=distilled_store,
+        goal_store=goal_store,
+        llm=None,   # not needed for task completion — no LLM call
+    )
+
+    output = await executor.process_task_completion(boundary_input)
+
+    if output.error:
+        raise HTTPException(status_code=500, detail=output.error.message)
+
+    # Unlock dependent tasks
+    all_tasks_result = goal_store.get_tasks_by_milestone(request.milestone_id)
+    if all_tasks_result.success:
+        for task in all_tasks_result.data:
+            if task.status == TaskStatus.PENDING:
+                unmet = [
+                    dep for dep in task.dependencies
+                    if dep != request.task_id
+                    and goal_store.get_task(dep).data.status != TaskStatus.COMPLETED
+                    if goal_store.get_task(dep).success
+                ]
+                if not unmet:
+                    task.status = TaskStatus.AVAILABLE
+                    goal_store.upsert_task(task)
+
+    return {
+        "task_id": request.task_id,
+        "success": output.success,
+        "state": "COMPLETED",
+    }
+
+
+===== storage\store_types.py =====
+# PATH: stride_backend/storage/store_types.py
+# DOMAIN: Shared return types for all storage operations across raw and distilled stores.
+
+from __future__ import annotations
+
+from typing import Generic, Optional, TypeVar
+from pydantic import BaseModel
+
+T = TypeVar("T")
+
+
+class StoreError(BaseModel):
+    code: str       # Valid values: NOT_FOUND | ALREADY_EXISTS | READ_ERROR | WRITE_ERROR
+    message: str
+    operation: str
+
+
+class StoreResult(BaseModel, Generic[T]):
+    success: bool
+    data: Optional[T] = None
+    error: Optional[StoreError] = None
+
+
+===== core\schemas\contracts\execution_engine.py =====
+# PATH: stride_backend/core/schemas/contracts/execution_engine.py
+from __future__ import annotations
+from datetime import date
+from typing import List, Optional
+from pydantic import BaseModel
+from core.schemas.contracts.shared import BoundaryError
+from core.schemas.enums import EnergyLevel, TaskTag
+from core.schemas.entities import Task
+
+# ── Shared allocation data ─────────────────────────────────────────────────────
+class MilestoneAllocationData(BaseModel):
+    """Minimal milestone data passed to SchedulingComponent and SlotAllocator."""
+    milestone_id: str
+    tri_vector_weight: float
+    min_weekly_units: int
+    max_weekly_units: int
+    schema_version: int = 1
+
+# ── SchedulingComponent contracts ──────────────────────────────────────────────
+class SlotAllocationInput(BaseModel):
+    user_id: str
+    week_start: date
+    milestones: List[MilestoneAllocationData]   # was active_milestone_ids: List[str]
+    slot_grid: dict
+    notes: Optional[str] = None
+    schema_version: int = 1
+
+class DeepSessionPlan(BaseModel):
+    milestone_id: str
+    assigned_days: List[str]
+    sessions_planned: int
+    sessions_needed: int
+    partial_allocation: bool = False
+    schema_version: int = 1
+
+class SlotAllocationOutput(BaseModel):
+    user_id: str
+    week_start: date
+    deep_session_plans: List[DeepSessionPlan]
+    error: Optional[BoundaryError] = None
+    schema_version: int = 1
+
+# ── SlotAllocator contracts ────────────────────────────────────────────────────
+class QueuePullRequest(BaseModel):
+    user_id: str
+    current_energy_level: EnergyLevel
+    last_task_tag: Optional[TaskTag] = None
+    last_milestone_id: Optional[str] = None
+    consecutive_pull_count: int = 0
+    force_pull: bool = False
+    schema_version: int = 1
+
+class QueuePullResponse(BaseModel):
+    pulled_task: Optional[Task] = None
+    state_message: str
+    error: Optional[BoundaryError] = None
+    schema_version: int = 1
+
+# ── Weekly aggregation ─────────────────────────────────────────────────────────
+class MilestoneUtilization(BaseModel):
+    milestone_id: str
+    description: str
+    consumed_units: int
+    max_weekly_units: int
+    utilization_pct: float
+    below_floor: bool
+    schema_version: int = 1
+
+class WeeklyAggregatedSummary(BaseModel):
+    user_id: str
+    week_start: str
+    milestones_active: int
+    tasks_completed: int
+    tasks_stalled: int
+    deep_work_sessions: int
+    mechanical_bias_pct: float
+    milestone_utilization: List[MilestoneUtilization]
+    goals_below_floor: List[str]
+    schema_version: int = 1
+
+

@@ -1,0 +1,715 @@
+===== agents\model_agent_executor\agent.py (NOT FOUND) =====
+
+
+===== core\schemas\contracts\weekly_summary.py (NOT FOUND) =====
+
+
+===== storage\distilled_store.py =====
+# PATH: stride_backend/storage/distilled_store.py
+# DOMAIN: TinyDB persistence for distilled user model and priority list.
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, timezone
+from typing import Any
+
+from tinydb import TinyDB, Query
+
+from core.schemas.entities import DistilledModel, PriorityList
+from storage.store_types import StoreError, StoreResult
+
+_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?")
+
+
+class DistilledStore:
+    def __init__(self, db: TinyDB) -> None:
+        self._model_table = db.table("distilled_models")
+        self._priority_table = db.table("priority_lists")
+
+    def _serialise(self, data: Any) -> Any:
+        if isinstance(data, datetime):
+            return data.isoformat()
+        if isinstance(data, dict):
+            return {k: self._serialise(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._serialise(item) for item in data]
+        return data
+
+    def _deserialise(self, data: Any) -> Any:
+        if isinstance(data, str) and _ISO_RE.match(data):
+            try:
+                return datetime.fromisoformat(data)
+            except ValueError:
+                return data
+        if isinstance(data, dict):
+            return {k: self._deserialise(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._deserialise(item) for item in data]
+        return data
+
+    # ── DistilledModel ─────────────────────────────────────────────────────────
+
+    def get_model(self, user_id: str) -> StoreResult[DistilledModel]:
+        try:
+            Q = Query()
+            doc = self._model_table.get(Q.user_id == user_id)
+            if doc is None:
+                return StoreResult(
+                    success=False,
+                    error=StoreError(
+                        code="NOT_FOUND",
+                        message=f"No DistilledModel for user {user_id}",
+                        operation="get_model",
+                    ),
+                )
+            model = DistilledModel(**self._deserialise(dict(doc)))
+            return StoreResult(success=True, data=model)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR", message=str(e), operation="get_model"
+                ),
+            )
+
+    def write_model(self, model: DistilledModel) -> StoreResult[None]:
+        try:
+            model.distillation_version += 1
+            model.last_distilled_at = datetime.now(timezone.utc)
+            serialised = self._serialise(model.model_dump())
+            Q = Query()
+            self._model_table.upsert(serialised, Q.user_id == model.user_id)
+            return StoreResult(success=True, data=None)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="WRITE_ERROR", message=str(e), operation="write_model"
+                ),
+            )
+
+    def get_model_snapshot(self, user_id: str) -> StoreResult[DistilledModel]:
+        """
+        Returns the DistilledModel directly as snapshot.
+        ModelAgentExecutor passes this to LLM prompts via model_dump().
+        """
+        return self.get_model(user_id)
+
+    def write_model_snapshot(self, model: DistilledModel) -> StoreResult[None]:
+        """Alias for write_model — used by executor after weekly guidance."""
+        return self.write_model(model)
+
+    def initialise_user(self, user_id: str) -> StoreResult[None]:
+        existing = self.get_model(user_id)
+        if existing.success:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="ALREADY_EXISTS",
+                    message=f"DistilledModel already exists for user {user_id}",
+                    operation="initialise_user",
+                ),
+            )
+
+        model = DistilledModel(
+            user_id=user_id,
+            notes=None,
+            distillation_version=0,
+            last_distilled_at=datetime.now(timezone.utc),
+        )
+
+        priority_list = PriorityList(
+            user_id=user_id,
+            ranked_goals=[],
+            last_updated=datetime.now(timezone.utc),
+        )
+
+        model_result = self.write_model(model)
+        if not model_result.success:
+            return model_result
+
+        return self.write_priority_list(priority_list)
+
+    # ── PriorityList ───────────────────────────────────────────────────────────
+
+    def get_priority_list(self, user_id: str) -> StoreResult[PriorityList]:
+        try:
+            Q = Query()
+            doc = self._priority_table.get(Q.user_id == user_id)
+            if doc is None:
+                return StoreResult(
+                    success=False,
+                    error=StoreError(
+                        code="NOT_FOUND",
+                        message=f"No PriorityList for user {user_id}",
+                        operation="get_priority_list",
+                    ),
+                )
+            priority_list = PriorityList(**self._deserialise(dict(doc)))
+            return StoreResult(success=True, data=priority_list)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR", message=str(e), operation="get_priority_list"
+                ),
+            )
+
+    def write_priority_list(self, priority_list: PriorityList) -> StoreResult[None]:
+        try:
+            priority_list.last_updated = datetime.now(timezone.utc)
+            serialised = self._serialise(priority_list.model_dump())
+            Q = Query()
+            self._priority_table.upsert(
+                serialised, Q.user_id == priority_list.user_id
+            )
+            return StoreResult(success=True, data=None)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="WRITE_ERROR", message=str(e), operation="write_priority_list"
+                ),
+            )
+
+
+===== storage\raw_store.py =====
+# PATH: stride_backend/storage/raw_store.py
+# DOMAIN: TinyDB persistence for raw user interaction data.
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, timezone
+from typing import Any, List
+
+from tinydb import TinyDB, Query
+
+from core.schemas.entities import FeedbackEvent, PhaseTransition, RawUserModel
+from storage.store_types import StoreError, StoreResult
+
+_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?")
+
+
+class RawStore:
+    def __init__(self, db: TinyDB) -> None:
+        self._table = db.table("raw_user_models")
+
+    def _serialise(self, data: Any) -> Any:
+        if isinstance(data, datetime):
+            return data.isoformat()
+        if isinstance(data, dict):
+            return {k: self._serialise(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._serialise(item) for item in data]
+        return data
+
+    def _deserialise(self, data: Any) -> Any:
+        if isinstance(data, str) and _ISO_RE.match(data):
+            try:
+                return datetime.fromisoformat(data)
+            except ValueError:
+                return data
+        if isinstance(data, dict):
+            return {k: self._deserialise(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._deserialise(item) for item in data]
+        return data
+
+    def get(self, user_id: str) -> StoreResult[RawUserModel]:
+        try:
+            Q = Query()
+            doc = self._table.get(Q.user_id == user_id)
+            if doc is None:
+                return StoreResult(
+                    success=False,
+                    error=StoreError(
+                        code="NOT_FOUND",
+                        message=f"No RawUserModel for user {user_id}",
+                        operation="get",
+                    ),
+                )
+            model = RawUserModel(**self._deserialise(dict(doc)))
+            return StoreResult(success=True, data=model)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(code="READ_ERROR", message=str(e), operation="get"),
+            )
+
+    def upsert(self, model: RawUserModel) -> StoreResult[None]:
+        try:
+            serialised = self._serialise(model.model_dump())
+            Q = Query()
+            self._table.upsert(serialised, Q.user_id == model.user_id)
+            return StoreResult(success=True, data=None)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(code="WRITE_ERROR", message=str(e), operation="upsert"),
+            )
+
+    def append_feedback_event(
+        self, user_id: str, event: FeedbackEvent
+    ) -> StoreResult[None]:
+        result = self.get(user_id)
+        if not result.success:
+            return result
+        raw_model = result.data
+        raw_model.feedback_events.append(event)
+        raw_model.last_updated = datetime.now(timezone.utc)
+        return self.upsert(raw_model)
+
+    def append_phase_transition(
+        self, user_id: str, transition: PhaseTransition
+    ) -> StoreResult[None]:
+        result = self.get(user_id)
+        if not result.success:
+            return result
+        raw_model = result.data
+        raw_model.phase_transitions.append(transition)
+        raw_model.last_updated = datetime.now(timezone.utc)
+        return self.upsert(raw_model)
+
+    def initialise_user(self, user_id: str) -> StoreResult[None]:
+        result = self.get(user_id)
+        if result.success:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="ALREADY_EXISTS",
+                    message=f"User {user_id} already exists",
+                    operation="initialise_user",
+                ),
+            )
+        fresh = RawUserModel(
+            user_id=user_id,
+            feedback_events=[],
+            phase_transitions=[],
+            last_updated=datetime.now(timezone.utc),
+        )
+        return self.upsert(fresh)
+
+    def get_feedback_events_by_goal(
+        self, user_id: str, goal_id: str
+    ) -> StoreResult[List[FeedbackEvent]]:
+        result = self.get(user_id)
+        if not result.success:
+            return result
+        filtered = [
+            e for e in result.data.feedback_events
+            if e.goal_id == goal_id
+        ]
+        return StoreResult(success=True, data=filtered)
+
+
+===== api\routes\weekly.py =====
+# PATH: stride_backend/api/routes/weekly.py
+# DOMAIN: Weekly cycle route — guidance generation + state reset
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import List
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from agents.model_agent.executor import ModelAgentExecutor
+from api.dependencies import get_distilled_store, get_goal_store, get_raw_store
+from core.config import SLOT_UNIT_CONSTANTS, settings
+from core.schemas.contracts.execution_engine import (
+    MilestoneUtilization,
+    WeeklyAggregatedSummary,
+)
+from core.schemas.enums import TaskStatus, TaskTag
+from storage.distilled_store import DistilledStore
+from storage.goal_store import GoalStore
+from storage.raw_store import RawStore
+
+router = APIRouter(prefix="/weekly", tags=["weekly"])
+
+
+# ── Request model ──────────────────────────────────────────────────────────────
+
+class WeeklyCycleRequest(BaseModel):
+    user_id: str
+    week_start: str     # ISO date string e.g. "2025-06-02"
+
+
+# ── Aggregation helper ─────────────────────────────────────────────────────────
+
+def _build_weekly_summary(
+    user_id: str,
+    week_start: str,
+    goal_store: GoalStore,
+    raw_store: RawStore,
+) -> WeeklyAggregatedSummary:
+    """
+    Python aggregates raw data into a typed summary.
+    LLM reads this summary — never raw events.
+    """
+    # Active milestones
+    milestones_result = goal_store.get_active_milestones_by_user(user_id)
+    milestones = milestones_result.data if milestones_result.success else []
+
+    # All tasks for user
+    tasks_result = goal_store.get_tasks_by_user(user_id)
+    all_tasks = tasks_result.data if tasks_result.success else []
+
+    # Compute consumed units per milestone from completed tasks
+    consumed: dict = {}
+    tasks_completed = 0
+    tasks_stalled = 0
+    deep_work_sessions = 0
+    total_completed = 0
+    mechanical_completed = 0
+
+    for task in all_tasks:
+        if task.status == TaskStatus.COMPLETED:
+            tasks_completed += 1
+            total_completed += 1
+            units = SLOT_UNIT_CONSTANTS.get(task.tag, 1)
+            consumed[task.milestone_id] = consumed.get(task.milestone_id, 0) + units
+            if task.tag == TaskTag.DEEP:
+                deep_work_sessions += 1
+            if task.tag == TaskTag.MECHANICAL:
+                mechanical_completed += 1
+        if task.stalled_flag:
+            tasks_stalled += 1
+
+    mechanical_bias_pct = (
+        mechanical_completed / total_completed if total_completed > 0 else 0.0
+    )
+
+    # Build milestone utilization
+    milestone_utilization: List[MilestoneUtilization] = []
+    goals_below_floor: List[str] = []
+
+    for m in milestones:
+        consumed_units = consumed.get(m.milestone_id, 0)
+        max_units = m.max_weekly_units if m.max_weekly_units > 0 else 1
+        utilization_pct = consumed_units / max_units
+        below_floor = consumed_units < m.min_weekly_units
+
+        milestone_utilization.append(MilestoneUtilization(
+            milestone_id=m.milestone_id,
+            description=m.description,
+            consumed_units=consumed_units,
+            max_weekly_units=m.max_weekly_units,
+            utilization_pct=utilization_pct,
+            below_floor=below_floor,
+        ))
+
+        if below_floor:
+            goals_below_floor.append(m.goal_id)
+
+    return WeeklyAggregatedSummary(
+        user_id=user_id,
+        week_start=week_start,
+        milestones_active=len(milestones),
+        tasks_completed=tasks_completed,
+        tasks_stalled=tasks_stalled,
+        deep_work_sessions=deep_work_sessions,
+        mechanical_bias_pct=mechanical_bias_pct,
+        milestone_utilization=milestone_utilization,
+        goals_below_floor=list(set(goals_below_floor)),
+    )
+
+
+# ── Route ──────────────────────────────────────────────────────────────────────
+
+@router.post("/cycle")
+async def run_weekly_cycle(
+    request: WeeklyCycleRequest,
+    goal_store: GoalStore = Depends(get_goal_store),
+    raw_store: RawStore = Depends(get_raw_store),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+):
+    """
+    Flow 3 — Weekly cycle.
+    Track A: Aggregate weekly data → run GuidanceAgent → write DistilledModel.
+    Track B: Reset consumed state (NOTE: consumed_units tracked client-side
+             in v1, so backend reset is a no-op — documented for v2).
+    """
+    # Build aggregated summary — pure Python, no LLM
+    weekly_summary = _build_weekly_summary(
+        user_id=request.user_id,
+        week_start=request.week_start,
+        goal_store=goal_store,
+        raw_store=raw_store,
+    )
+
+    # Run weekly guidance — LLM call
+    executor = ModelAgentExecutor(
+        raw_store=raw_store,
+        distilled_store=distilled_store,
+        goal_store=goal_store,
+        llm=settings.get_llm(),
+    )
+
+    guidance_output = await executor.get_weekly_guidance(
+        user_id=request.user_id,
+        weekly_summary=weekly_summary,
+    )
+
+    return {
+        "user_id": request.user_id,
+        "week_start": request.week_start,
+        "guidance": {
+            "guidance_type":          guidance_output.guidance_type,
+            "recommendations":        guidance_output.recommendations,
+            "cross_goal_observation": guidance_output.cross_goal_observation,
+            "check_in_prompt":        guidance_output.check_in_prompt,
+            "thin_input_flag":        guidance_output.thin_input_flag,
+            "reasoning_summary":      guidance_output.reasoning_summary,
+        },
+        "summary": {
+            "milestones_active":   weekly_summary.milestones_active,
+            "tasks_completed":     weekly_summary.tasks_completed,
+            "tasks_stalled":       weekly_summary.tasks_stalled,
+            "deep_work_sessions":  weekly_summary.deep_work_sessions,
+            "mechanical_bias_pct": weekly_summary.mechanical_bias_pct,
+            "goals_below_floor":   weekly_summary.goals_below_floor,
+        },
+    }
+
+
+===== core\scheduling\scheduling_component.py =====
+# PATH: stride_backend/core/scheduling/scheduling_component.py
+# DOMAIN: SchedulingComponent — deterministic DEEP session planner.
+# No LLM. No storage. Pure Python.
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from math import floor
+from typing import Dict, List, Tuple
+
+from core.schemas.contracts.execution_engine import (
+    DeepSessionPlan,
+    MilestoneAllocationData,
+    SlotAllocationInput,
+    SlotAllocationOutput,
+)
+from core.schemas.contracts.shared import BoundaryError
+from core.schemas.enums import EnergyLevel, TaskTag
+from core.config import DEEP_MIN_GAP_DAYS, SLOT_UNIT_CONSTANTS
+
+
+DAY_INDEX: Dict[str, int] = {
+    "Monday": 0,
+    "Tuesday": 1,
+    "Wednesday": 2,
+    "Thursday": 3,
+    "Friday": 4,
+    "Saturday": 5,
+    "Sunday": 6,
+}
+
+DAY_FROM_INDEX: Dict[int, str] = {v: k for k, v in DAY_INDEX.items()}
+
+
+@dataclass
+class _EligibleWindow:
+    """Internal representation of a HIGH-energy slot."""
+    day: str
+    day_index: int
+    start_time: str
+    taken: bool = False
+
+
+class SchedulingComponent:
+    """
+    Deterministic DEEP session planner.
+
+    Receives the user's SlotGrid and active milestone data.
+    Returns a DeepSessionPlan per milestone indicating which days
+    are designated for DEEP work.
+
+    Zero LLM calls. Zero storage imports.
+    The session plan is a guide — not a hard constraint on task pulling.
+    """
+
+    def allocate_slots(self, input: SlotAllocationInput) -> SlotAllocationOutput:
+        """
+        Main entry point. Synchronous — no async needed (pure computation).
+
+        Args:
+            input: SlotAllocationInput containing active milestone data,
+                   SlotGrid, and week metadata.
+
+        Returns:
+            SlotAllocationOutput with a DeepSessionPlan per milestone.
+        """
+        try:
+            plans = self._run_allocation(input)
+            return SlotAllocationOutput(
+                user_id=input.user_id,
+                week_start=input.week_start,
+                deep_session_plans=plans,
+                error=None,
+            )
+        except Exception as e:
+            return SlotAllocationOutput(
+                user_id=input.user_id,
+                week_start=input.week_start,
+                deep_session_plans=[],
+                error=BoundaryError(
+                    code="ALLOCATION_FAILURE",
+                    message=f"SchedulingComponent failed: {e}",
+                    component="SchedulingComponent",
+                    retry_count=0,
+                ),
+            )
+
+    def _run_allocation(self, input: SlotAllocationInput) -> List[DeepSessionPlan]:
+        # Step 1 — extract and sort HIGH energy windows
+        eligible_windows = self._extract_eligible_windows(input.slot_grid)
+
+        if not eligible_windows:
+            # No HIGH energy windows at all this week. Milestones with a
+            # real allocation (max_weekly_units > 0) get partial_allocation;
+            # zero-unit milestones stay cleanly skipped (no allocation owed).
+            plans: List[DeepSessionPlan] = []
+            for m in input.milestones:
+                needed = self._sessions_needed(m, available_windows=0)
+                plans.append(DeepSessionPlan(
+                    milestone_id=m.milestone_id,
+                    assigned_days=[],
+                    sessions_planned=0,
+                    sessions_needed=needed,
+                    partial_allocation=needed > 0,
+                ))
+            return plans
+
+        # Step 2 — sort milestones by weight descending (highest priority first)
+        milestones = sorted(
+            input.milestones,
+            key=lambda m: m.tri_vector_weight,
+            reverse=True,
+        )
+
+        plans: List[DeepSessionPlan] = []
+
+        for milestone in milestones:
+            if milestone.max_weekly_units == 0:
+                plans.append(DeepSessionPlan(
+                    milestone_id=milestone.milestone_id,
+                    assigned_days=[],
+                    sessions_planned=0,
+                    sessions_needed=0,
+                    partial_allocation=False,
+                ))
+                continue
+
+            needed = self._sessions_needed(
+                milestone, available_windows=len(eligible_windows)
+            )
+            assigned_days, sessions_assigned = self._greedy_assign(
+                eligible_windows, needed
+            )
+            partial = sessions_assigned < needed
+
+            plans.append(DeepSessionPlan(
+                milestone_id=milestone.milestone_id,
+                assigned_days=assigned_days,
+                sessions_planned=sessions_assigned,
+                sessions_needed=needed,
+                partial_allocation=partial,
+            ))
+
+        return plans
+
+    def _extract_eligible_windows(self, slot_grid: dict) -> List[_EligibleWindow]:
+        """
+        Parse SlotGrid dict and return HIGH energy windows sorted by day then time.
+        """
+        slots = slot_grid.get("slots", [])
+        windows: List[_EligibleWindow] = []
+
+        for slot in slots:
+            energy = str(slot.get("energy_level", "")).upper()
+            if energy != EnergyLevel.HIGH.value:
+                continue
+            day = slot.get("day", "")
+            if day not in DAY_INDEX:
+                continue
+            windows.append(_EligibleWindow(
+                day=day,
+                day_index=DAY_INDEX[day],
+                start_time=slot.get("start_time", "00:00"),
+            ))
+
+        # Sort by day_index then start_time
+        windows.sort(key=lambda w: (w.day_index, w.start_time))
+        return windows
+
+    def _sessions_needed(
+        self, milestone: MilestoneAllocationData, available_windows: int
+    ) -> int:
+        """
+        Compute how many DEEP sessions a milestone needs this week.
+        Based on max_weekly_units and DEEP slot cost, minimum 1 if the
+        milestone has any allocation, and capped by the count of HIGH
+        energy windows available this week (spec Step 2). When there are
+        zero windows available at all, the cap is intentionally skipped
+        here so the resulting plan still reflects unmet demand (the
+        caller marks partial_allocation accordingly) rather than reporting
+        a misleading "0 needed".
+        """
+        max_units = milestone.max_weekly_units
+        if max_units == 0:
+            return 0
+        deep_cost = SLOT_UNIT_CONSTANTS[TaskTag.DEEP]
+        needed = max(1, floor(max_units / deep_cost))
+        if available_windows > 0:
+            needed = min(needed, available_windows)
+        return needed
+
+    def _greedy_assign(
+        self,
+        windows: List[_EligibleWindow],
+        sessions_needed: int,
+    ) -> Tuple[List[str], int]:
+        """
+        Greedy interval scheduling with DEEP_MIN_GAP_DAYS cooldown.
+        Mutates window.taken in place — shared pool across milestones.
+
+        Returns:
+            (assigned_days, sessions_assigned)
+        """
+        last_day_index = -99    # sentinel — no prior assignment
+        sessions_assigned = 0
+        assigned_days: List[str] = []
+
+        for window in windows:
+            if window.taken:
+                continue
+
+            gap = window.day_index - last_day_index
+            if gap < DEEP_MIN_GAP_DAYS:
+                continue
+
+            # Valid window
+            window.taken = True
+            assigned_days.append(window.day)
+            last_day_index = window.day_index
+            sessions_assigned += 1
+
+            if sessions_assigned == sessions_needed:
+                break
+
+        # Fallback — if nothing assigned, take any free window ignoring gap
+        if sessions_assigned == 0 and sessions_needed > 0:
+            for window in windows:
+                if not window.taken:
+                    window.taken = True
+                    assigned_days.append(window.day)
+                    sessions_assigned = 1
+                    break
+
+        return assigned_days, sessions_assigned
+
+

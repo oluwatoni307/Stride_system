@@ -1,0 +1,1232 @@
+================================================================================
+FILE: api\routes\tasks.py
+================================================================================
+# PATH: stride_backend/api/routes/tasks.py
+# DOMAIN: Task execution routes — pull and complete
+
+from __future__ import annotations
+
+from datetime import date, timedelta
+from typing import Dict, Optional
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from agents.model_agent.executor import ModelAgentExecutor
+from api.dependencies import (
+    get_distilled_store,
+    get_goal_store,
+    get_raw_store,
+    get_slot_allocator,
+)
+from core.aggregation.consumed_units import compute_consumed_units
+from core.config import SLOT_UNIT_CONSTANTS
+from core.execution.slot_allocator import SlotAllocator
+from core.feedback.feedback_loop import FeedbackLoop
+from core.schemas.contracts.execution_engine import (
+    MilestoneAllocationData,
+    QueuePullRequest,
+)
+from core.schemas.contracts.feedback_loop import Boundary3Input
+from core.schemas.enums import EnergyLevel, TaskStatus, TaskTag
+from storage.distilled_store import DistilledStore
+from storage.goal_store import GoalStore
+from storage.raw_store import RawStore
+
+router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+# ── Request / Response models ──────────────────────────────────────────────────
+
+class PullTaskRequest(BaseModel):
+    user_id: str
+    current_energy_level: str          # "HIGH" | "MEDIUM" | "LOW"
+    last_task_tag: Optional[str] = None
+    last_milestone_id: Optional[str] = None
+    consecutive_pull_count: int = 0
+    force_pull: bool = False
+
+
+class CompleteTaskRequest(BaseModel):
+    user_id: str
+    task_id: str
+    goal_id: str
+    milestone_id: str
+    completion_timestamp: Optional[str] = None
+    user_note: Optional[str] = None
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+# _get_consumed_units removed (Brief 030) — its unfiltered, full-history scan
+# is replaced by core.aggregation.consumed_units.compute_consumed_units,
+# scoped to the current week. See that module for the single source of
+# truth; weekly.py's _build_weekly_summary uses the same function.
+
+def _get_milestone_allocation_data(
+    user_id: str,
+    goal_store: GoalStore,
+) -> list[MilestoneAllocationData]:
+    """
+    Fetch all ACTIVE milestones and return as MilestoneAllocationData list.
+    """
+    result = goal_store.get_active_milestones_by_user(user_id)
+    if not result.success:
+        return []
+
+    return [
+        MilestoneAllocationData(
+            milestone_id=m.milestone_id,
+            tri_vector_weight=m.tri_vector_weight,
+            min_weekly_units=m.min_weekly_units,
+            max_weekly_units=m.max_weekly_units,
+        )
+        for m in result.data
+    ]
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+
+@router.post("/pull")
+async def pull_task(
+    request: PullTaskRequest,
+    goal_store: GoalStore = Depends(get_goal_store),
+    raw_store: RawStore = Depends(get_raw_store),
+    slot_allocator: SlotAllocator = Depends(get_slot_allocator),
+):
+    """
+    Flow 2 — Pull next task for the user based on current energy level
+    and client-held execution state.
+    """
+    # Validate energy level
+    try:
+        energy = EnergyLevel(request.current_energy_level.upper())
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid energy level: {request.current_energy_level}",
+        )
+
+    # Parse last_task_tag
+    last_tag = None
+    if request.last_task_tag:
+        try:
+            last_tag = TaskTag(request.last_task_tag.upper())
+        except ValueError:
+            pass
+
+    # Build pull request
+    pull_request = QueuePullRequest(
+        user_id=request.user_id,
+        current_energy_level=energy,
+        last_task_tag=last_tag,
+        last_milestone_id=request.last_milestone_id,
+        consecutive_pull_count=request.consecutive_pull_count,
+        force_pull=request.force_pull,
+    )
+
+    # Fetch active tasks and milestone data
+    active_tasks_result = goal_store.get_available_tasks_by_user(request.user_id)
+    active_tasks = active_tasks_result.data if active_tasks_result.success else []
+
+    milestone_data = _get_milestone_allocation_data(request.user_id, goal_store)
+
+    # consumed_units scoped to the current week (Brief 030) — was previously
+    # an unfiltered full-history scan via the now-deleted _get_consumed_units.
+    current_week_start = date.today() - timedelta(days=date.today().weekday())
+    consumed_units = compute_consumed_units(
+        user_id=request.user_id,
+        week_start=current_week_start,
+        goal_store=goal_store,
+        raw_store=raw_store,
+    )
+
+    # Run SlotAllocator
+    response = slot_allocator.pull(
+        request=pull_request,
+        active_tasks=active_tasks,
+        milestone_data=milestone_data,
+        consumed_units=consumed_units,
+    )
+
+    if response.error:
+        raise HTTPException(status_code=500, detail=response.error.message)
+
+    return {
+        "pulled_task": (
+            response.pulled_task.model_dump()
+            if response.pulled_task else None
+        ),
+        "state_message": response.state_message,
+    }
+
+
+@router.post("/complete")
+async def complete_task(
+    request: CompleteTaskRequest,
+    goal_store: GoalStore = Depends(get_goal_store),
+    raw_store: RawStore = Depends(get_raw_store),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+):
+    """
+    Flow 3 — Mark task as complete. Writes FeedbackEvent, updates task status.
+    """
+    # Verify task exists
+    task_result = goal_store.get_task(request.task_id)
+    if not task_result.success:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Task {request.task_id} not found.",
+        )
+
+    # Package completion event
+    feedback_loop = FeedbackLoop()
+    boundary_input = feedback_loop.package_completion_event(
+        user_id=request.user_id,
+        task_id=request.task_id,
+        goal_id=request.goal_id,
+        milestone_id=request.milestone_id,
+        completion_timestamp=request.completion_timestamp,
+        user_note=request.user_note,
+    )
+
+    # Process via ModelAgentExecutor
+    executor = ModelAgentExecutor(
+        raw_store=raw_store,
+        distilled_store=distilled_store,
+        goal_store=goal_store,
+        llm=None,   # not needed for task completion — no LLM call
+    )
+
+    output = await executor.process_task_completion(boundary_input)
+
+    if output.error:
+        raise HTTPException(status_code=500, detail=output.error.message)
+
+    # Unlock dependent tasks
+    all_tasks_result = goal_store.get_tasks_by_milestone(request.milestone_id)
+    if all_tasks_result.success:
+        for task in all_tasks_result.data:
+            if task.status == TaskStatus.PENDING:
+                unmet = [
+                    dep for dep in task.dependencies
+                    if dep != request.task_id
+                    and goal_store.get_task(dep).data.status != TaskStatus.COMPLETED
+                    if goal_store.get_task(dep).success
+                ]
+                if not unmet:
+                    task.status = TaskStatus.AVAILABLE
+                    goal_store.upsert_task(task)
+
+    return {
+        "task_id": request.task_id,
+        "success": output.success,
+        "state": "COMPLETED",
+    }
+
+
+================================================================================
+FILE: storage\raw_store.py
+================================================================================
+# PATH: stride_backend/storage/raw_store.py
+# DOMAIN: TinyDB persistence for raw user interaction data.
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, timezone
+from typing import Any, List
+
+from tinydb import TinyDB, Query
+
+from core.schemas.entities import FeedbackEvent, PhaseTransition, RawUserModel
+from storage.store_types import StoreError, StoreResult
+
+_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?")
+
+
+class RawStore:
+    def __init__(self, db: TinyDB) -> None:
+        self._table = db.table("raw_user_models")
+
+    def _serialise(self, data: Any) -> Any:
+        if isinstance(data, datetime):
+            return data.isoformat()
+        if isinstance(data, dict):
+            return {k: self._serialise(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._serialise(item) for item in data]
+        return data
+
+    def _deserialise(self, data: Any) -> Any:
+        if isinstance(data, str) and _ISO_RE.match(data):
+            try:
+                return datetime.fromisoformat(data)
+            except ValueError:
+                return data
+        if isinstance(data, dict):
+            return {k: self._deserialise(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._deserialise(item) for item in data]
+        return data
+
+    def get(self, user_id: str) -> StoreResult[RawUserModel]:
+        try:
+            Q = Query()
+            doc = self._table.get(Q.user_id == user_id)
+            if doc is None:
+                return StoreResult(
+                    success=False,
+                    error=StoreError(
+                        code="NOT_FOUND",
+                        message=f"No RawUserModel for user {user_id}",
+                        operation="get",
+                    ),
+                )
+            model = RawUserModel(**self._deserialise(dict(doc)))
+            return StoreResult(success=True, data=model)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(code="READ_ERROR", message=str(e), operation="get"),
+            )
+
+    def upsert(self, model: RawUserModel) -> StoreResult[None]:
+        try:
+            serialised = self._serialise(model.model_dump())
+            Q = Query()
+            self._table.upsert(serialised, Q.user_id == model.user_id)
+            return StoreResult(success=True, data=None)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(code="WRITE_ERROR", message=str(e), operation="upsert"),
+            )
+
+    def append_feedback_event(
+        self, user_id: str, event: FeedbackEvent
+    ) -> StoreResult[None]:
+        result = self.get(user_id)
+        if not result.success:
+            return result
+        raw_model = result.data
+        raw_model.feedback_events.append(event)
+        raw_model.last_updated = datetime.now(timezone.utc)
+        return self.upsert(raw_model)
+
+    def append_phase_transition(
+        self, user_id: str, transition: PhaseTransition
+    ) -> StoreResult[None]:
+        result = self.get(user_id)
+        if not result.success:
+            return result
+        raw_model = result.data
+        raw_model.phase_transitions.append(transition)
+        raw_model.last_updated = datetime.now(timezone.utc)
+        return self.upsert(raw_model)
+
+    def initialise_user(self, user_id: str) -> StoreResult[None]:
+        result = self.get(user_id)
+        if result.success:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="ALREADY_EXISTS",
+                    message=f"User {user_id} already exists",
+                    operation="initialise_user",
+                ),
+            )
+        fresh = RawUserModel(
+            user_id=user_id,
+            feedback_events=[],
+            phase_transitions=[],
+            last_updated=datetime.now(timezone.utc),
+        )
+        return self.upsert(fresh)
+
+    def get_feedback_events_by_goal(
+        self, user_id: str, goal_id: str
+    ) -> StoreResult[List[FeedbackEvent]]:
+        result = self.get(user_id)
+        if not result.success:
+            return result
+        filtered = [
+            e for e in result.data.feedback_events
+            if e.goal_id == goal_id
+        ]
+        return StoreResult(success=True, data=filtered)
+
+
+================================================================================
+FILE: core\execution\slot_allocator.py
+================================================================================
+# PATH: stride_backend/core/execution/slot_allocator.py
+# DOMAIN: SlotAllocator — real-time task pull engine.
+# No LLM. No storage. Pure deterministic Python.
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Tuple
+
+from core.config import DEEP_LOCKOUT_SENTINEL, MAX_CONSECUTIVE_PULLS
+from core.schemas.contracts.execution_engine import (
+    MilestoneAllocationData,
+    QueuePullRequest,
+    QueuePullResponse,
+)
+from core.schemas.contracts.shared import BoundaryError
+from core.schemas.entities import Task
+from core.schemas.enums import EnergyLevel, TaskStatus, TaskTag
+
+
+class SlotAllocator:
+    """
+    Real-time task pull engine.
+
+    Receives the current user state and active task pool.
+    Returns the single best task to work on right now.
+
+    Zero LLM calls. Zero storage imports.
+    All inputs are passed by the API route.
+    """
+
+    def pull(
+        self,
+        request: QueuePullRequest,
+        active_tasks: List[Task],
+        milestone_data: List[MilestoneAllocationData],
+        consumed_units: Dict[str, int],
+    ) -> QueuePullResponse:
+        """
+        Determine and return the next task to pull.
+
+        Args:
+            request:        QueuePullRequest from client (carries client state)
+            active_tasks:   All AVAILABLE tasks for this user
+            milestone_data: All ACTIVE milestones with min/max units
+            consumed_units: Dict of milestone_id → units consumed this week
+
+        Returns:
+            QueuePullResponse with pulled_task and state_message
+        """
+        try:
+            return self._run_pull(request, active_tasks, milestone_data, consumed_units)
+        except Exception as e:
+            return QueuePullResponse(
+                pulled_task=None,
+                state_message="NO_ELIGIBLE_TASKS",
+                error=BoundaryError(
+                    code="PULL_FAILURE",
+                    message=f"SlotAllocator failed: {e}",
+                    component="SlotAllocator",
+                    retry_count=0,
+                ),
+            )
+
+    def _run_pull(
+        self,
+        request: QueuePullRequest,
+        active_tasks: List[Task],
+        milestone_data: List[MilestoneAllocationData],
+        consumed_units: Dict[str, int],
+    ) -> QueuePullResponse:
+
+        # Phase A — eligibility filter.
+        # eligible_pre_ceiling is the pool right before the ceiling filter (filter 6)
+        # runs. Comparing it against the final `eligible` pool lets Phase C tell
+        # "ceiling filter emptied an otherwise-eligible pool" (-> ALL_CEILINGS_REACHED)
+        # apart from "pool was already empty for other reasons" (-> NO_ELIGIBLE_TASKS).
+        # Without this distinction, the ceiling filter removing every remaining task
+        # in Phase A means Phase B never runs, and ALL_CEILINGS_REACHED could never
+        # be reported even when every milestone has in fact hit its ceiling.
+        eligible, eligible_pre_ceiling = self._filter_eligible(
+            request, active_tasks, milestone_data, consumed_units
+        )
+
+        if not eligible:
+            # DEEP lockout takes precedence as the most descriptive message
+            if (request.last_task_tag == TaskTag.DEEP or
+                    request.consecutive_pull_count == DEEP_LOCKOUT_SENTINEL):
+                return QueuePullResponse(
+                    pulled_task=None,
+                    state_message="DEEP_LOCKOUT",
+                )
+            if eligible_pre_ceiling:
+                return QueuePullResponse(
+                    pulled_task=None,
+                    state_message="ALL_CEILINGS_REACHED",
+                )
+            return QueuePullResponse(
+                pulled_task=None,
+                state_message="NO_ELIGIBLE_TASKS",
+            )
+
+        # Phase B — two-tier priority selection
+        pulled_task, state_message = self._select_task(
+            eligible, milestone_data, consumed_units
+        )
+
+        if pulled_task is None:
+            return QueuePullResponse(
+                pulled_task=None,
+                state_message=state_message,
+            )
+
+        return QueuePullResponse(
+            pulled_task=pulled_task,
+            state_message=state_message,
+            error=None,
+        )
+
+    # ── Phase A — Eligibility Filter ──────────────────────────────────────────
+
+    def _filter_eligible(
+        self,
+        request: QueuePullRequest,
+        active_tasks: List[Task],
+        milestone_data: List[MilestoneAllocationData],
+        consumed_units: Dict[str, int],
+    ) -> Tuple[List[Task], List[Task]]:
+        """
+        Returns (eligible, eligible_pre_ceiling). See _run_pull for why both
+        are needed.
+        """
+
+        # Build ceiling lookup
+        ceiling_map: Dict[str, int] = {
+            m.milestone_id: m.max_weekly_units for m in milestone_data
+        }
+
+        # Build completed-task lookup for dependency filter
+        completed_ids = {
+            t.task_id for t in active_tasks if t.status == TaskStatus.COMPLETED
+        }
+
+        eligible_pre_ceiling: List[Task] = []
+        eligible: List[Task] = []
+
+        for task in active_tasks:
+
+            # Filters 1 & 2 — only AVAILABLE tasks proceed.
+            # This also excludes SUPERSEDED tasks (replaced by breakdown tasks),
+            # which the brief doesn't mention explicitly but which should never
+            # be auto-pulled — they've been replaced by other tasks.
+            if task.status != TaskStatus.AVAILABLE:
+                continue
+
+            # Filter 3 — dependency guard: all dependencies must be COMPLETED
+            if task.dependencies:
+                unmet = [dep for dep in task.dependencies if dep not in completed_ids]
+                if unmet:
+                    continue
+
+            # Filter 4 — DEEP lockout
+            if request.last_task_tag == TaskTag.DEEP:
+                if task.tag == TaskTag.DEEP:
+                    continue
+
+            # Filter 5 — energy filter (skipped if force_pull)
+            if not request.force_pull:
+                if request.current_energy_level != EnergyLevel.HIGH:
+                    if task.tag == TaskTag.DEEP:
+                        continue
+
+            # Filter 7 — clumping filter (force rotation after MAX_CONSECUTIVE_PULLS)
+            if (request.consecutive_pull_count >= MAX_CONSECUTIVE_PULLS and
+                    request.last_milestone_id is not None):
+                if task.milestone_id == request.last_milestone_id:
+                    continue
+
+            # Filter 8 — DEEP sentinel check (force milestone rotation)
+            if request.consecutive_pull_count == DEEP_LOCKOUT_SENTINEL:
+                if task.milestone_id == request.last_milestone_id:
+                    continue
+
+            eligible_pre_ceiling.append(task)
+
+            # Filter 6 — ceiling filter
+            milestone_id = task.milestone_id
+            consumed = consumed_units.get(milestone_id, 0)
+            ceiling = ceiling_map.get(milestone_id, 0)
+            if ceiling > 0 and consumed >= ceiling:
+                continue
+
+            eligible.append(task)
+
+        return eligible, eligible_pre_ceiling
+
+    # ── Phase B — Two-Tier Priority Selection ─────────────────────────────────
+
+    def _select_task(
+        self,
+        eligible: List[Task],
+        milestone_data: List[MilestoneAllocationData],
+        consumed_units: Dict[str, int],
+    ) -> Tuple[Optional[Task], str]:
+
+        # Build eligible milestone set
+        eligible_milestone_ids = {t.milestone_id for t in eligible}
+
+        # Tier 1 — Safety Net: find starved milestones
+        starved = [
+            m for m in milestone_data
+            if m.milestone_id in eligible_milestone_ids
+            and m.min_weekly_units > 0
+            and consumed_units.get(m.milestone_id, 0) < m.min_weekly_units
+        ]
+
+        if starved:
+            # Sort by floor deficit ascending — most behind gets priority
+            starved.sort(
+                key=lambda m: consumed_units.get(m.milestone_id, 0) / m.min_weekly_units
+            )
+            target_milestone_id = starved[0].milestone_id
+            task = self._first_task_for_milestone(eligible, target_milestone_id)
+            return task, "PULLING"
+
+        # Tier 2 — Growth Phase: all milestones above floor
+        safe = [
+            m for m in milestone_data
+            if m.milestone_id in eligible_milestone_ids
+            and consumed_units.get(m.milestone_id, 0) < m.max_weekly_units
+        ]
+
+        if not safe:
+            return None, "ALL_CEILINGS_REACHED"
+
+        # Sort by ceiling progress ascending — furthest from ceiling gets priority
+        safe.sort(
+            key=lambda m: consumed_units.get(m.milestone_id, 0) / m.max_weekly_units
+        )
+        target_milestone_id = safe[0].milestone_id
+        task = self._first_task_for_milestone(eligible, target_milestone_id)
+        return task, "MINIMUMS_MET"
+
+    def _first_task_for_milestone(
+        self,
+        eligible: List[Task],
+        milestone_id: str,
+    ) -> Optional[Task]:
+        """Return the first eligible task belonging to the target milestone."""
+        for task in eligible:
+            if task.milestone_id == milestone_id:
+                return task
+        return None
+
+
+================================================================================
+FILE: core\scheduling\scheduling_component.py
+================================================================================
+# PATH: stride_backend/core/scheduling/scheduling_component.py
+# DOMAIN: SchedulingComponent — deterministic DEEP session planner.
+# No LLM. No storage. Pure Python.
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from math import floor
+from typing import Dict, List, Tuple
+
+from core.schemas.contracts.execution_engine import (
+    DeepSessionPlan,
+    MilestoneAllocationData,
+    SlotAllocationInput,
+    SlotAllocationOutput,
+)
+from core.schemas.contracts.shared import BoundaryError
+from core.schemas.enums import EnergyLevel, TaskTag
+from core.config import DEEP_MIN_GAP_DAYS, SLOT_UNIT_CONSTANTS
+
+
+DAY_INDEX: Dict[str, int] = {
+    "Monday": 0,
+    "Tuesday": 1,
+    "Wednesday": 2,
+    "Thursday": 3,
+    "Friday": 4,
+    "Saturday": 5,
+    "Sunday": 6,
+}
+
+DAY_FROM_INDEX: Dict[int, str] = {v: k for k, v in DAY_INDEX.items()}
+
+
+@dataclass
+class _EligibleWindow:
+    """Internal representation of a HIGH-energy slot."""
+    day: str
+    day_index: int
+    start_time: str
+    taken: bool = False
+
+
+class SchedulingComponent:
+    """
+    Deterministic DEEP session planner.
+
+    Receives the user's SlotGrid and active milestone data.
+    Returns a DeepSessionPlan per milestone indicating which days
+    are designated for DEEP work.
+
+    Zero LLM calls. Zero storage imports.
+    The session plan is a guide — not a hard constraint on task pulling.
+    """
+
+    def allocate_slots(self, input: SlotAllocationInput) -> SlotAllocationOutput:
+        """
+        Main entry point. Synchronous — no async needed (pure computation).
+
+        Args:
+            input: SlotAllocationInput containing active milestone data,
+                   SlotGrid, and week metadata.
+
+        Returns:
+            SlotAllocationOutput with a DeepSessionPlan per milestone.
+        """
+        try:
+            plans = self._run_allocation(input)
+            return SlotAllocationOutput(
+                user_id=input.user_id,
+                week_start=input.week_start,
+                deep_session_plans=plans,
+                error=None,
+            )
+        except Exception as e:
+            return SlotAllocationOutput(
+                user_id=input.user_id,
+                week_start=input.week_start,
+                deep_session_plans=[],
+                error=BoundaryError(
+                    code="ALLOCATION_FAILURE",
+                    message=f"SchedulingComponent failed: {e}",
+                    component="SchedulingComponent",
+                    retry_count=0,
+                ),
+            )
+
+    def _run_allocation(self, input: SlotAllocationInput) -> List[DeepSessionPlan]:
+        # Step 1 — extract and sort HIGH energy windows
+        eligible_windows = self._extract_eligible_windows(input.slot_grid)
+
+        if not eligible_windows:
+            # No HIGH energy windows at all this week. Milestones with a
+            # real allocation (max_weekly_units > 0) get partial_allocation;
+            # zero-unit milestones stay cleanly skipped (no allocation owed).
+            plans: List[DeepSessionPlan] = []
+            for m in input.milestones:
+                needed = self._sessions_needed(m, available_windows=0)
+                plans.append(DeepSessionPlan(
+                    milestone_id=m.milestone_id,
+                    assigned_days=[],
+                    sessions_planned=0,
+                    sessions_needed=needed,
+                    partial_allocation=needed > 0,
+                ))
+            return plans
+
+        # Step 2 — sort milestones by weight descending (highest priority first)
+        milestones = sorted(
+            input.milestones,
+            key=lambda m: m.tri_vector_weight,
+            reverse=True,
+        )
+
+        plans: List[DeepSessionPlan] = []
+
+        for milestone in milestones:
+            if milestone.max_weekly_units == 0:
+                plans.append(DeepSessionPlan(
+                    milestone_id=milestone.milestone_id,
+                    assigned_days=[],
+                    sessions_planned=0,
+                    sessions_needed=0,
+                    partial_allocation=False,
+                ))
+                continue
+
+            needed = self._sessions_needed(
+                milestone, available_windows=len(eligible_windows)
+            )
+            assigned_days, sessions_assigned = self._greedy_assign(
+                eligible_windows, needed
+            )
+            partial = sessions_assigned < needed
+
+            plans.append(DeepSessionPlan(
+                milestone_id=milestone.milestone_id,
+                assigned_days=assigned_days,
+                sessions_planned=sessions_assigned,
+                sessions_needed=needed,
+                partial_allocation=partial,
+            ))
+
+        return plans
+
+    def _extract_eligible_windows(self, slot_grid: dict) -> List[_EligibleWindow]:
+        """
+        Parse SlotGrid dict and return HIGH energy windows sorted by day then time.
+        """
+        slots = slot_grid.get("slots", [])
+        windows: List[_EligibleWindow] = []
+
+        for slot in slots:
+            energy = str(slot.get("energy_level", "")).upper()
+            if energy != EnergyLevel.HIGH.value:
+                continue
+            day = slot.get("day", "")
+            if day not in DAY_INDEX:
+                continue
+            windows.append(_EligibleWindow(
+                day=day,
+                day_index=DAY_INDEX[day],
+                start_time=slot.get("start_time", "00:00"),
+            ))
+
+        # Sort by day_index then start_time
+        windows.sort(key=lambda w: (w.day_index, w.start_time))
+        return windows
+
+    def _sessions_needed(
+        self, milestone: MilestoneAllocationData, available_windows: int
+    ) -> int:
+        """
+        Compute how many DEEP sessions a milestone needs this week.
+        Based on max_weekly_units and DEEP slot cost, minimum 1 if the
+        milestone has any allocation, and capped by the count of HIGH
+        energy windows available this week (spec Step 2). When there are
+        zero windows available at all, the cap is intentionally skipped
+        here so the resulting plan still reflects unmet demand (the
+        caller marks partial_allocation accordingly) rather than reporting
+        a misleading "0 needed".
+        """
+        max_units = milestone.max_weekly_units
+        if max_units == 0:
+            return 0
+        deep_cost = SLOT_UNIT_CONSTANTS[TaskTag.DEEP]
+        needed = max(1, floor(max_units / deep_cost))
+        if available_windows > 0:
+            needed = min(needed, available_windows)
+        return needed
+
+    def _greedy_assign(
+        self,
+        windows: List[_EligibleWindow],
+        sessions_needed: int,
+    ) -> Tuple[List[str], int]:
+        """
+        Greedy interval scheduling with DEEP_MIN_GAP_DAYS cooldown.
+        Mutates window.taken in place — shared pool across milestones.
+
+        Returns:
+            (assigned_days, sessions_assigned)
+        """
+        last_day_index = -99    # sentinel — no prior assignment
+        sessions_assigned = 0
+        assigned_days: List[str] = []
+
+        for window in windows:
+            if window.taken:
+                continue
+
+            gap = window.day_index - last_day_index
+            if gap < DEEP_MIN_GAP_DAYS:
+                continue
+
+            # Valid window
+            window.taken = True
+            assigned_days.append(window.day)
+            last_day_index = window.day_index
+            sessions_assigned += 1
+
+            if sessions_assigned == sessions_needed:
+                break
+
+        # Fallback — if nothing assigned, take any free window ignoring gap
+        if sessions_assigned == 0 and sessions_needed > 0:
+            for window in windows:
+                if not window.taken:
+                    window.taken = True
+                    assigned_days.append(window.day)
+                    sessions_assigned = 1
+                    break
+
+        return assigned_days, sessions_assigned
+
+
+================================================================================
+FILE: core\aggregation\consumed_units.py
+================================================================================
+# PATH: stride_backend/core/aggregation/consumed_units.py
+# DOMAIN: Single source of truth for computing consumed_units per milestone,
+# scoped to a given week. Replaces the two independent, unfiltered
+# implementations previously in weekly.py and tasks.py.
+
+from __future__ import annotations
+
+from datetime import date, timedelta, timezone
+from typing import Dict
+
+from core.config import SLOT_UNIT_CONSTANTS
+from storage.goal_store import GoalStore
+from storage.raw_store import RawStore
+
+
+def compute_consumed_units(
+    user_id: str,
+    week_start: date,
+    goal_store: GoalStore,
+    raw_store: RawStore,
+) -> Dict[str, int]:
+    """
+    Returns {milestone_id: consumed_units} for COMPLETED tasks whose
+    FeedbackEvent.completed_at falls within [week_start, week_start + 7 days).
+
+    Source of truth is FeedbackEvent.completed_at (RawStore), not Task.status
+    alone — Task carries no timestamp by design (current-state only).
+    A task's slot-unit cost (tag → units) still comes from the Task entity
+    itself, joined by task_id.
+    """
+    week_end = week_start + timedelta(days=7)
+
+    raw_result = raw_store.get(user_id)
+    if not raw_result.success:
+        return {}
+
+    tasks_result = goal_store.get_tasks_by_user(user_id)
+    if not tasks_result.success:
+        return {}
+
+    tag_by_task_id = {t.task_id: t.tag for t in tasks_result.data}
+
+    consumed: Dict[str, int] = {}
+
+    for event in raw_result.data.feedback_events:
+        completed_date = event.completed_at
+        if completed_date.tzinfo is None:
+            completed_date = completed_date.replace(tzinfo=timezone.utc)
+
+        event_date = completed_date.date()
+        if not (week_start <= event_date < week_end):
+            continue
+
+        tag = tag_by_task_id.get(event.task_id)
+        if tag is None:
+            # FeedbackEvent references a task no longer present — skip,
+            # do not raise. Defensive: tasks are never hard-deleted per
+            # architecture doc (SUPERSEDED is a soft-delete status), but
+            # don't let a dangling reference break weekly aggregation.
+            continue
+
+        units = SLOT_UNIT_CONSTANTS.get(tag, 1)
+        consumed[event.milestone_id] = consumed.get(event.milestone_id, 0) + units
+
+    return consumed
+
+
+================================================================================
+FILE: core\schemas\entities.py
+================================================================================
+from __future__ import annotations
+from datetime import date, datetime
+from typing import List, Optional
+from pydantic import BaseModel, Field, field_validator
+
+from core.schemas.enums import (
+    TaskTag, TaskStatus, MilestoneStatus, GoalStatus, EnergyLevel
+)
+
+
+# ─────────────────────────────────────────────
+# GOAL
+# ─────────────────────────────────────────────
+
+class Goal(BaseModel):
+    goal_id: str
+    user_id: str
+    name: str
+    status: GoalStatus = GoalStatus.ACTIVE
+    macro_impact: int               # 1–5, cascades to child milestones as I
+    terminal_deadline: date         # Python uses this to compute U
+    schema_version: int = 2
+
+
+# ─────────────────────────────────────────────
+# MILESTONE
+# ─────────────────────────────────────────────
+
+class Milestone(BaseModel):
+    milestone_id: str
+    goal_id: str
+    user_id: str
+    description: str
+    objectives: List[str] = Field(default_factory=list)
+    success_metrics: List[str] = Field(default_factory=list)
+    tri_vector_weight: float = 0.0          # computed by Python, not LLM
+    min_weekly_units: int = 0               # floor — derived from weight
+    max_weekly_units: int = 0               # ceiling — derived from weight
+    status: MilestoneStatus = MilestoneStatus.DRAFT
+    schema_version: int = 2
+
+
+# ─────────────────────────────────────────────
+# TASK
+# ─────────────────────────────────────────────
+
+class Task(BaseModel):
+    task_id: str
+    milestone_id: str
+    goal_id: str
+    user_id: str
+    description: str
+    tag: TaskTag
+    dependencies: List[str] = Field(default_factory=list)  # list of task_ids
+    status: TaskStatus = TaskStatus.PENDING
+    stalled_flag: bool = False
+    schema_version: int = 2
+
+    # NOTE: No slot_units field. Slot cost derived at runtime:
+    # MECHANICAL=1, MODERATE=2, DEEP=4 (from config.SLOT_UNIT_CONSTANTS)
+
+
+# ─────────────────────────────────────────────
+# SLOT GRID
+# ─────────────────────────────────────────────
+
+class TimeSlot(BaseModel):
+    day: str                        # e.g. "Monday"
+    start_time: str                 # e.g. "09:00"
+    energy_level: EnergyLevel
+
+
+class SlotGrid(BaseModel):
+    user_id: str
+    week_start: date
+    slots: List[TimeSlot] = Field(default_factory=list)
+    schema_version: int = 1
+
+    # NOTE: SlotGrid holds NO task IDs.
+    # It is an energy index — describes the user's week, not their schedule.
+
+
+# ─────────────────────────────────────────────
+# ONBOARDING PROFILE
+# ─────────────────────────────────────────────
+
+class EnergyBlock(BaseModel):
+    label: str                  # user-defined free text, e.g. "morning", "post-lunch slump"
+    start_time: str             # "HH:MM" 24hr format
+    end_time: str               # "HH:MM" 24hr format, must be > start_time
+    energy_level: EnergyLevel   # HIGH | MEDIUM | LOW
+
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def validate_time_format(cls, v: str) -> str:
+        import re
+        if not re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", v):
+            raise ValueError(f"Invalid HH:MM time format: {v}")
+        return v
+
+
+class OnboardingProfile(BaseModel):
+    user_id: str
+    max_workable_hours: float                   # hard weekly cap
+    weekday_blocks: List[EnergyBlock]            # applied Mon-Fri
+    weekend_blocks: List[EnergyBlock]            # applied Sat-Sun. Client sends
+                                                  # matching blocks for both if user
+                                                  # wants no weekday/weekend difference
+                                                  # — this is a user decision, not a
+                                                  # system default. Never silently
+                                                  # duplicated server-side.
+    schema_version: int = 3
+
+
+# ─────────────────────────────────────────────
+# RAW STORE ENTITIES
+# ─────────────────────────────────────────────
+
+class FeedbackEvent(BaseModel):
+    id: str
+    task_id: str
+    goal_id: str
+    milestone_id: str
+    user_id: str
+    completed_at: datetime
+    note: Optional[str] = None
+    significance_check_triggered: bool = False
+    schema_version: int = 1
+
+
+class PhaseTransition(BaseModel):
+    id: str
+    goal_id: str
+    user_id: str
+    from_status: str
+    to_status: str
+    transitioned_at: datetime
+    reason: str
+    schema_version: int = 1
+
+
+class RawUserModel(BaseModel):
+    user_id: str
+    feedback_events: List[FeedbackEvent] = Field(default_factory=list)
+    phase_transitions: List[PhaseTransition] = Field(default_factory=list)
+    last_updated: datetime
+    schema_version: int = 1
+
+
+# ─────────────────────────────────────────────
+# DISTILLED STORE ENTITIES
+# ─────────────────────────────────────────────
+
+class PriorityEntry(BaseModel):
+    goal_id: str
+    goal_name: str
+    weight: float                   # tri_vector_weight — used for ordering
+    schema_version: int = 1
+
+
+class PriorityList(BaseModel):
+    user_id: str
+    ranked_goals: List[PriorityEntry] = Field(default_factory=list)
+    last_updated: datetime
+    schema_version: int = 1
+
+
+class DistilledModel(BaseModel):
+    user_id: str
+    notes: Optional[str] = None     # free-form coaching notes from weekly guidance
+    distillation_version: int = 0   # incremented on each write
+    last_distilled_at: Optional[datetime] = None
+    schema_version: int = 1
+
+
+================================================================================
+GREP: stagnation|lockout|clump|stalled_flag|consecutive_pull|first_made_available (case-insensitive)
+================================================================================
+C:\Users\user\stride_backend\agents\task_decomposer\agent.py:3: # Called once on milestone creation. Called again only for stagnation breakdown.
+C:\Users\user\stride_backend\api\routes\tasks.py:42: consecutive_pull_count: int = 0
+C:\Users\user\stride_backend\api\routes\tasks.py:119: consecutive_pull_count=request.consecutive_pull_count,
+C:\Users\user\stride_backend\api\routes\weekly.py:61: stalled_flag is a current-state flag with no time dimension to filter on.
+C:\Users\user\stride_backend\api\routes\weekly.py:89: stalled_count = sum(1 for t in all_tasks if t.stalled_flag)
+C:\Users\user\stride_backend\core\execution\slot_allocator.py:9: from core.config import DEEP_LOCKOUT_SENTINEL, MAX_CONSECUTIVE_PULLS
+C:\Users\user\stride_backend\core\execution\slot_allocator.py:85: # DEEP lockout takes precedence as the most descriptive message
+C:\Users\user\stride_backend\core\execution\slot_allocator.py:87: request.consecutive_pull_count == DEEP_LOCKOUT_SENTINEL):
+C:\Users\user\stride_backend\core\execution\slot_allocator.py:90: state_message="DEEP_LOCKOUT",
+C:\Users\user\stride_backend\core\execution\slot_allocator.py:161: # Filter 4 � DEEP lockout
+C:\Users\user\stride_backend\core\execution\slot_allocator.py:172: # Filter 7 � clumping filter (force rotation after MAX_CONSECUTIVE_PULLS)
+C:\Users\user\stride_backend\core\execution\slot_allocator.py:173: if (request.consecutive_pull_count >= MAX_CONSECUTIVE_PULLS and
+C:\Users\user\stride_backend\core\execution\slot_allocator.py:179: if request.consecutive_pull_count == DEEP_LOCKOUT_SENTINEL:
+C:\Users\user\stride_backend\core\schemas\contracts\execution_engine.py:49: consecutive_pull_count: int = 0
+C:\Users\user\stride_backend\core\schemas\entities.py:56: stalled_flag: bool = False
+C:\Users\user\stride_backend\core\config.py:77: MAX_CONSECUTIVE_PULLS   = 2         # before forced milestone rotation (MODERATE/MECHANICAL)
+C:\Users\user\stride_backend\core\config.py:78: DEEP_LOCKOUT_SENTINEL   = 99        # consecutive_pull_count sentinel that forces rotation
+C:\Users\user\stride_backend\core\config.py:79: STALL_THRESHOLD_DAYS    = 7         # days AVAILABLE before stalled_flag set on DEEP task
+C:\Users\user\stride_backend\evaluation\evaluation\personas\amaka_eze.py:122: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\evaluation\personas\amaka_eze.py:144: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\evaluation\personas\amaka_eze.py:222: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\evaluation\personas\amaka_eze.py:257: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\evaluation\personas\amaka_eze.py:363: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\evaluation\personas\amaka_eze.py:400: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\amaka_eze.py:122: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\amaka_eze.py:144: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\amaka_eze.py:214: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\amaka_eze.py:243: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\amaka_eze.py:343: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\amaka_eze.py:372: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:11: - Anti-clumping                (Month 2: consecutive pulls from same milestone)
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:232: # Also tests anti-clumping � 3rd consecutive pull from same milestone
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:241: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:268: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:283: # Second pull same week � consecutive_pull_count=1.
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:291: "consecutive_pull_count": 1,
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:307: # milestone, this should trigger anti-clumping and redirect elsewhere.
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:308: # Layer B: anti-clumping check.
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:316: "consecutive_pull_count": 2,
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:320: "Layer B: anti-clumping check. If pull_w2_a and pull_w2_b "
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:346: "consecutive_pull_count": 3,
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:397: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:440: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:465: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:492: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:524: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\chiamaka_okafor.py:9: - Stagnation flagging          (2-week gap ? DEEP task unpulled 7+ days)
+C:\Users\user\stride_backend\evaluation\personas\chiamaka_okafor.py:124: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\chiamaka_okafor.py:200: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\chiamaka_okafor.py:204: "Pull a task here. If it is DEEP, it becomes the stagnation "
+C:\Users\user\stride_backend\evaluation\personas\chiamaka_okafor.py:206: "trigger stagnation flagging in Month 3's gap. Do NOT complete "
+C:\Users\user\stride_backend\evaluation\personas\chiamaka_okafor.py:222: # and unpulled for 14+ days, which exceeds the 7-day stagnation window.
+C:\Users\user\stride_backend\evaluation\personas\chiamaka_okafor.py:223: # Layer B: stagnation flagging � stalled_flag should be set and the
+C:\Users\user\stride_backend\evaluation\personas\chiamaka_okafor.py:233: "stagnation on the task pulled in week 6. Layer B stagnation "
+C:\Users\user\stride_backend\evaluation\personas\chiamaka_okafor.py:245: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\chiamaka_okafor.py:296: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\chiamaka_okafor.py:381: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:9: - DEEP lockout                 (Month 1�2: structured goals, clean task graph)
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:10: - Anti-clumping                (Month 1�2: high output, consecutive pulls)
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:157: # Daniel pulls consistently. Test DEEP lockout and anti-clumping here.
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:165: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:181: # exclude DEEP tasks. Layer B: DEEP lockout check.
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:189: "consecutive_pull_count": 1,
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:193: "Layer B: DEEP lockout. If pull_w1_a was DEEP, this pull must "
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:209: # Third pull � anti-clumping check. If pull_w1_a and pull_w1_b were
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:218: "consecutive_pull_count": 2,
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:222: "Layer B: anti-clumping. If pull_w1_a and pull_w1_b were from "
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:250: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:288: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:325: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:418: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:478: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:515: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\ibrahim_suleiman.py:10: - Stagnation flagging          (zero-activity weeks in irregular pattern)
+C:\Users\user\stride_backend\evaluation\personas\ibrahim_suleiman.py:129: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\ibrahim_suleiman.py:147: "AVAILABLE and unpulled for 7+ days � stagnation window opens. "
+C:\Users\user\stride_backend\evaluation\personas\ibrahim_suleiman.py:148: "Layer B: stagnation flagging check begins here."
+C:\Users\user\stride_backend\evaluation\personas\ibrahim_suleiman.py:159: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\ibrahim_suleiman.py:181: "consecutive_pull_count": 1,
+C:\Users\user\stride_backend\evaluation\personas\ibrahim_suleiman.py:265: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\ibrahim_suleiman.py:292: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\ibrahim_suleiman.py:330: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\ibrahim_suleiman.py:368: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\ibrahim_suleiman.py:399: # stagnation-under-pressure instead.
+C:\Users\user\stride_backend\evaluation\personas\ibrahim_suleiman.py:427: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\margaret_sully.py:11: - DEEP lockout                 (tests that lockout holds even at low pace)
+C:\Users\user\stride_backend\evaluation\personas\margaret_sully.py:18: stagnation unless a DEEP task specifically goes 7+ unpulled days.
+C:\Users\user\stride_backend\evaluation\personas\margaret_sully.py:124: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\margaret_sully.py:128: "Layer B: DEEP lockout check candidate. If this pull returns "
+C:\Users\user\stride_backend\evaluation\personas\margaret_sully.py:131: "lockout must still hold across that gap."
+C:\Users\user\stride_backend\evaluation\personas\margaret_sully.py:207: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\margaret_sully.py:213: "Layer B: DEEP lockout � if pull_w2_a was DEEP, this pull "
+C:\Users\user\stride_backend\evaluation\personas\margaret_sully.py:251: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\margaret_sully.py:284: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\margaret_sully.py:341: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\margaret_sully.py:368: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\margaret_sully.py:402: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:115: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:146: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:173: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:266: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:293: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:332: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:364: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:453: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:480: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:507: "consecutive_pull_count": 0,
+C:\Users\user\stride_backend\stride_backend\core\execution\slot_allocator.py:9: from core.config import DEEP_LOCKOUT_SENTINEL, MAX_CONSECUTIVE_PULLS
+C:\Users\user\stride_backend\stride_backend\core\execution\slot_allocator.py:85: # DEEP lockout takes precedence as the most descriptive message
+C:\Users\user\stride_backend\stride_backend\core\execution\slot_allocator.py:87: request.consecutive_pull_count == DEEP_LOCKOUT_SENTINEL):
+C:\Users\user\stride_backend\stride_backend\core\execution\slot_allocator.py:90: state_message="DEEP_LOCKOUT",
+C:\Users\user\stride_backend\stride_backend\core\execution\slot_allocator.py:161: # Filter 4 � DEEP lockout
+C:\Users\user\stride_backend\stride_backend\core\execution\slot_allocator.py:172: # Filter 7 � clumping filter (force rotation after MAX_CONSECUTIVE_PULLS)
+C:\Users\user\stride_backend\stride_backend\core\execution\slot_allocator.py:173: if (request.consecutive_pull_count >= MAX_CONSECUTIVE_PULLS and
+C:\Users\user\stride_backend\stride_backend\core\execution\slot_allocator.py:179: if request.consecutive_pull_count == DEEP_LOCKOUT_SENTINEL:
+C:\Users\user\stride_backend\stride_backend\tests\test_slot_allocator.py:62: consecutive_pull_count=consecutive,
+C:\Users\user\stride_backend\stride_backend\tests\test_slot_allocator.py:114: def test_deep_lockout_after_deep_task(self):
+C:\Users\user\stride_backend\stride_backend\tests\test_slot_allocator.py:126: def test_deep_lockout_state_message_when_only_deep_available(self):
+C:\Users\user\stride_backend\stride_backend\tests\test_slot_allocator.py:127: """If only DEEP tasks remain after lockout, return DEEP_LOCKOUT."""
+C:\Users\user\stride_backend\stride_backend\tests\test_slot_allocator.py:133: assert result.state_message == "DEEP_LOCKOUT"
+C:\Users\user\stride_backend\stride_backend\tests\test_slot_allocator.py:170: def test_force_pull_does_not_bypass_deep_lockout(self):
+C:\Users\user\stride_backend\stride_backend\tests\test_slot_allocator.py:171: """force_pull bypasses energy filter only � not DEEP lockout."""
+C:\Users\user\stride_backend\stride_backend\tests\test_slot_allocator.py:182: assert result.state_message == "DEEP_LOCKOUT"
+C:\Users\user\stride_backend\stride_backend\tests\test_slot_allocator.py:184: def test_anti_clumping_forces_rotation_after_2_pulls(self):
+C:\Users\user\stride_backend\stride_backend\tests\test_slot_allocator.py:203: """DEEP_LOCKOUT_SENTINEL forces rotation away from last milestone."""
+C:\Users\user\stride_backend\config.py:64: MAX_CONSECUTIVE_PULLS   = 2         # before forced milestone rotation (MODERATE/MECHANICAL)
+C:\Users\user\stride_backend\config.py:65: DEEP_LOCKOUT_SENTINEL   = 99        # consecutive_pull_count sentinel that forces rotation
+C:\Users\user\stride_backend\config.py:66: STALL_THRESHOLD_DAYS    = 7         # days AVAILABLE before stalled_flag set on DEEP task

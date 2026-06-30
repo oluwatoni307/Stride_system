@@ -1,0 +1,1186 @@
+===== api\routes\weekly.py =====
+# PATH: stride_backend/api/routes/weekly.py
+# DOMAIN: Weekly cycle route — guidance generation + state reset
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import List
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from agents.model_agent.executor import ModelAgentExecutor
+from api.dependencies import get_distilled_store, get_goal_store, get_raw_store
+from core.config import SLOT_UNIT_CONSTANTS, settings
+from core.schemas.contracts.execution_engine import (
+    MilestoneUtilization,
+    WeeklyAggregatedSummary,
+)
+from core.schemas.enums import TaskStatus, TaskTag
+from storage.distilled_store import DistilledStore
+from storage.goal_store import GoalStore
+from storage.raw_store import RawStore
+
+router = APIRouter(prefix="/weekly", tags=["weekly"])
+
+
+# ── Request model ──────────────────────────────────────────────────────────────
+
+class WeeklyCycleRequest(BaseModel):
+    user_id: str
+    week_start: str     # ISO date string e.g. "2025-06-02"
+
+
+# ── Aggregation helper ─────────────────────────────────────────────────────────
+
+def _build_weekly_summary(
+    user_id: str,
+    week_start: str,
+    goal_store: GoalStore,
+    raw_store: RawStore,
+) -> WeeklyAggregatedSummary:
+    """
+    Python aggregates raw data into a typed summary.
+    LLM reads this summary — never raw events.
+    """
+    # Active milestones
+    milestones_result = goal_store.get_active_milestones_by_user(user_id)
+    milestones = milestones_result.data if milestones_result.success else []
+
+    # All tasks for user
+    tasks_result = goal_store.get_tasks_by_user(user_id)
+    all_tasks = tasks_result.data if tasks_result.success else []
+
+    # Compute consumed units per milestone from completed tasks
+    consumed: dict = {}
+    tasks_completed = 0
+    tasks_stalled = 0
+    deep_work_sessions = 0
+    total_completed = 0
+    mechanical_completed = 0
+
+    for task in all_tasks:
+        if task.status == TaskStatus.COMPLETED:
+            tasks_completed += 1
+            total_completed += 1
+            units = SLOT_UNIT_CONSTANTS.get(task.tag, 1)
+            consumed[task.milestone_id] = consumed.get(task.milestone_id, 0) + units
+            if task.tag == TaskTag.DEEP:
+                deep_work_sessions += 1
+            if task.tag == TaskTag.MECHANICAL:
+                mechanical_completed += 1
+        if task.stalled_flag:
+            tasks_stalled += 1
+
+    mechanical_bias_pct = (
+        mechanical_completed / total_completed if total_completed > 0 else 0.0
+    )
+
+    # Build milestone utilization
+    milestone_utilization: List[MilestoneUtilization] = []
+    goals_below_floor: List[str] = []
+
+    for m in milestones:
+        consumed_units = consumed.get(m.milestone_id, 0)
+        max_units = m.max_weekly_units if m.max_weekly_units > 0 else 1
+        utilization_pct = consumed_units / max_units
+        below_floor = consumed_units < m.min_weekly_units
+
+        milestone_utilization.append(MilestoneUtilization(
+            milestone_id=m.milestone_id,
+            description=m.description,
+            consumed_units=consumed_units,
+            max_weekly_units=m.max_weekly_units,
+            utilization_pct=utilization_pct,
+            below_floor=below_floor,
+        ))
+
+        if below_floor:
+            goals_below_floor.append(m.goal_id)
+
+    return WeeklyAggregatedSummary(
+        user_id=user_id,
+        week_start=week_start,
+        milestones_active=len(milestones),
+        tasks_completed=tasks_completed,
+        tasks_stalled=tasks_stalled,
+        deep_work_sessions=deep_work_sessions,
+        mechanical_bias_pct=mechanical_bias_pct,
+        milestone_utilization=milestone_utilization,
+        goals_below_floor=list(set(goals_below_floor)),
+    )
+
+
+# ── Route ──────────────────────────────────────────────────────────────────────
+
+@router.post("/cycle")
+async def run_weekly_cycle(
+    request: WeeklyCycleRequest,
+    goal_store: GoalStore = Depends(get_goal_store),
+    raw_store: RawStore = Depends(get_raw_store),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+):
+    """
+    Flow 3 — Weekly cycle.
+    Track A: Aggregate weekly data → run GuidanceAgent → write DistilledModel.
+    Track B: Reset consumed state (NOTE: consumed_units tracked client-side
+             in v1, so backend reset is a no-op — documented for v2).
+    """
+    # Build aggregated summary — pure Python, no LLM
+    weekly_summary = _build_weekly_summary(
+        user_id=request.user_id,
+        week_start=request.week_start,
+        goal_store=goal_store,
+        raw_store=raw_store,
+    )
+
+    # Run weekly guidance — LLM call
+    executor = ModelAgentExecutor(
+        raw_store=raw_store,
+        distilled_store=distilled_store,
+        goal_store=goal_store,
+        llm=settings.get_llm(),
+    )
+
+    guidance_output = await executor.get_weekly_guidance(
+        user_id=request.user_id,
+        weekly_summary=weekly_summary,
+    )
+
+    return {
+        "user_id": request.user_id,
+        "week_start": request.week_start,
+        "guidance": {
+            "guidance_type":          guidance_output.guidance_type,
+            "recommendations":        guidance_output.recommendations,
+            "cross_goal_observation": guidance_output.cross_goal_observation,
+            "check_in_prompt":        guidance_output.check_in_prompt,
+            "thin_input_flag":        guidance_output.thin_input_flag,
+            "reasoning_summary":      guidance_output.reasoning_summary,
+        },
+        "summary": {
+            "milestones_active":   weekly_summary.milestones_active,
+            "tasks_completed":     weekly_summary.tasks_completed,
+            "tasks_stalled":       weekly_summary.tasks_stalled,
+            "deep_work_sessions":  weekly_summary.deep_work_sessions,
+            "mechanical_bias_pct": weekly_summary.mechanical_bias_pct,
+            "goals_below_floor":   weekly_summary.goals_below_floor,
+        },
+    }
+
+
+===== api\routes\tasks.py =====
+# PATH: stride_backend/api/routes/tasks.py
+# DOMAIN: Task execution routes — pull and complete
+
+from __future__ import annotations
+
+from typing import Dict, Optional
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from agents.model_agent.executor import ModelAgentExecutor
+from api.dependencies import (
+    get_distilled_store,
+    get_goal_store,
+    get_raw_store,
+    get_slot_allocator,
+)
+from core.config import SLOT_UNIT_CONSTANTS
+from core.execution.slot_allocator import SlotAllocator
+from core.feedback.feedback_loop import FeedbackLoop
+from core.schemas.contracts.execution_engine import (
+    MilestoneAllocationData,
+    QueuePullRequest,
+)
+from core.schemas.contracts.feedback_loop import Boundary3Input
+from core.schemas.enums import EnergyLevel, TaskStatus, TaskTag
+from storage.distilled_store import DistilledStore
+from storage.goal_store import GoalStore
+from storage.raw_store import RawStore
+
+router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+# ── Request / Response models ──────────────────────────────────────────────────
+
+class PullTaskRequest(BaseModel):
+    user_id: str
+    current_energy_level: str          # "HIGH" | "MEDIUM" | "LOW"
+    last_task_tag: Optional[str] = None
+    last_milestone_id: Optional[str] = None
+    consecutive_pull_count: int = 0
+    force_pull: bool = False
+
+
+class CompleteTaskRequest(BaseModel):
+    user_id: str
+    task_id: str
+    goal_id: str
+    milestone_id: str
+    completion_timestamp: Optional[str] = None
+    user_note: Optional[str] = None
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _get_consumed_units(
+    user_id: str,
+    goal_store: GoalStore,
+    raw_store: RawStore,
+) -> Dict[str, int]:
+    """
+    Compute consumed_units per milestone for the current week
+    from completed tasks in GoalStore.
+    """
+    tasks_result = goal_store.get_tasks_by_user(user_id)
+    if not tasks_result.success:
+        return {}
+
+    consumed: Dict[str, int] = {}
+    for task in tasks_result.data:
+        if task.status == TaskStatus.COMPLETED:
+            units = SLOT_UNIT_CONSTANTS.get(task.tag, 1)
+            consumed[task.milestone_id] = consumed.get(task.milestone_id, 0) + units
+
+    return consumed
+
+
+def _get_milestone_allocation_data(
+    user_id: str,
+    goal_store: GoalStore,
+) -> list[MilestoneAllocationData]:
+    """
+    Fetch all ACTIVE milestones and return as MilestoneAllocationData list.
+    """
+    result = goal_store.get_active_milestones_by_user(user_id)
+    if not result.success:
+        return []
+
+    return [
+        MilestoneAllocationData(
+            milestone_id=m.milestone_id,
+            tri_vector_weight=m.tri_vector_weight,
+            min_weekly_units=m.min_weekly_units,
+            max_weekly_units=m.max_weekly_units,
+        )
+        for m in result.data
+    ]
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+
+@router.post("/pull")
+async def pull_task(
+    request: PullTaskRequest,
+    goal_store: GoalStore = Depends(get_goal_store),
+    raw_store: RawStore = Depends(get_raw_store),
+    slot_allocator: SlotAllocator = Depends(get_slot_allocator),
+):
+    """
+    Flow 2 — Pull next task for the user based on current energy level
+    and client-held execution state.
+    """
+    # Validate energy level
+    try:
+        energy = EnergyLevel(request.current_energy_level.upper())
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid energy level: {request.current_energy_level}",
+        )
+
+    # Parse last_task_tag
+    last_tag = None
+    if request.last_task_tag:
+        try:
+            last_tag = TaskTag(request.last_task_tag.upper())
+        except ValueError:
+            pass
+
+    # Build pull request
+    pull_request = QueuePullRequest(
+        user_id=request.user_id,
+        current_energy_level=energy,
+        last_task_tag=last_tag,
+        last_milestone_id=request.last_milestone_id,
+        consecutive_pull_count=request.consecutive_pull_count,
+        force_pull=request.force_pull,
+    )
+
+    # Fetch active tasks and milestone data
+    active_tasks_result = goal_store.get_available_tasks_by_user(request.user_id)
+    active_tasks = active_tasks_result.data if active_tasks_result.success else []
+
+    milestone_data = _get_milestone_allocation_data(request.user_id, goal_store)
+    consumed_units = _get_consumed_units(request.user_id, goal_store, raw_store)
+
+    # Run SlotAllocator
+    response = slot_allocator.pull(
+        request=pull_request,
+        active_tasks=active_tasks,
+        milestone_data=milestone_data,
+        consumed_units=consumed_units,
+    )
+
+    if response.error:
+        raise HTTPException(status_code=500, detail=response.error.message)
+
+    return {
+        "pulled_task": (
+            response.pulled_task.model_dump()
+            if response.pulled_task else None
+        ),
+        "state_message": response.state_message,
+    }
+
+
+@router.post("/complete")
+async def complete_task(
+    request: CompleteTaskRequest,
+    goal_store: GoalStore = Depends(get_goal_store),
+    raw_store: RawStore = Depends(get_raw_store),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+):
+    """
+    Flow 3 — Mark task as complete. Writes FeedbackEvent, updates task status.
+    """
+    # Verify task exists
+    task_result = goal_store.get_task(request.task_id)
+    if not task_result.success:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Task {request.task_id} not found.",
+        )
+
+    # Package completion event
+    feedback_loop = FeedbackLoop()
+    boundary_input = feedback_loop.package_completion_event(
+        user_id=request.user_id,
+        task_id=request.task_id,
+        goal_id=request.goal_id,
+        milestone_id=request.milestone_id,
+        completion_timestamp=request.completion_timestamp,
+        user_note=request.user_note,
+    )
+
+    # Process via ModelAgentExecutor
+    executor = ModelAgentExecutor(
+        raw_store=raw_store,
+        distilled_store=distilled_store,
+        goal_store=goal_store,
+        llm=None,   # not needed for task completion — no LLM call
+    )
+
+    output = await executor.process_task_completion(boundary_input)
+
+    if output.error:
+        raise HTTPException(status_code=500, detail=output.error.message)
+
+    # Unlock dependent tasks
+    all_tasks_result = goal_store.get_tasks_by_milestone(request.milestone_id)
+    if all_tasks_result.success:
+        for task in all_tasks_result.data:
+            if task.status == TaskStatus.PENDING:
+                unmet = [
+                    dep for dep in task.dependencies
+                    if dep != request.task_id
+                    and goal_store.get_task(dep).data.status != TaskStatus.COMPLETED
+                    if goal_store.get_task(dep).success
+                ]
+                if not unmet:
+                    task.status = TaskStatus.AVAILABLE
+                    goal_store.upsert_task(task)
+
+    return {
+        "task_id": request.task_id,
+        "success": output.success,
+        "state": "COMPLETED",
+    }
+
+
+===== storage\raw_store.py =====
+# PATH: stride_backend/storage/raw_store.py
+# DOMAIN: TinyDB persistence for raw user interaction data.
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, timezone
+from typing import Any, List
+
+from tinydb import TinyDB, Query
+
+from core.schemas.entities import FeedbackEvent, PhaseTransition, RawUserModel
+from storage.store_types import StoreError, StoreResult
+
+_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?")
+
+
+class RawStore:
+    def __init__(self, db: TinyDB) -> None:
+        self._table = db.table("raw_user_models")
+
+    def _serialise(self, data: Any) -> Any:
+        if isinstance(data, datetime):
+            return data.isoformat()
+        if isinstance(data, dict):
+            return {k: self._serialise(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._serialise(item) for item in data]
+        return data
+
+    def _deserialise(self, data: Any) -> Any:
+        if isinstance(data, str) and _ISO_RE.match(data):
+            try:
+                return datetime.fromisoformat(data)
+            except ValueError:
+                return data
+        if isinstance(data, dict):
+            return {k: self._deserialise(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._deserialise(item) for item in data]
+        return data
+
+    def get(self, user_id: str) -> StoreResult[RawUserModel]:
+        try:
+            Q = Query()
+            doc = self._table.get(Q.user_id == user_id)
+            if doc is None:
+                return StoreResult(
+                    success=False,
+                    error=StoreError(
+                        code="NOT_FOUND",
+                        message=f"No RawUserModel for user {user_id}",
+                        operation="get",
+                    ),
+                )
+            model = RawUserModel(**self._deserialise(dict(doc)))
+            return StoreResult(success=True, data=model)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(code="READ_ERROR", message=str(e), operation="get"),
+            )
+
+    def upsert(self, model: RawUserModel) -> StoreResult[None]:
+        try:
+            serialised = self._serialise(model.model_dump())
+            Q = Query()
+            self._table.upsert(serialised, Q.user_id == model.user_id)
+            return StoreResult(success=True, data=None)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(code="WRITE_ERROR", message=str(e), operation="upsert"),
+            )
+
+    def append_feedback_event(
+        self, user_id: str, event: FeedbackEvent
+    ) -> StoreResult[None]:
+        result = self.get(user_id)
+        if not result.success:
+            return result
+        raw_model = result.data
+        raw_model.feedback_events.append(event)
+        raw_model.last_updated = datetime.now(timezone.utc)
+        return self.upsert(raw_model)
+
+    def append_phase_transition(
+        self, user_id: str, transition: PhaseTransition
+    ) -> StoreResult[None]:
+        result = self.get(user_id)
+        if not result.success:
+            return result
+        raw_model = result.data
+        raw_model.phase_transitions.append(transition)
+        raw_model.last_updated = datetime.now(timezone.utc)
+        return self.upsert(raw_model)
+
+    def initialise_user(self, user_id: str) -> StoreResult[None]:
+        result = self.get(user_id)
+        if result.success:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="ALREADY_EXISTS",
+                    message=f"User {user_id} already exists",
+                    operation="initialise_user",
+                ),
+            )
+        fresh = RawUserModel(
+            user_id=user_id,
+            feedback_events=[],
+            phase_transitions=[],
+            last_updated=datetime.now(timezone.utc),
+        )
+        return self.upsert(fresh)
+
+    def get_feedback_events_by_goal(
+        self, user_id: str, goal_id: str
+    ) -> StoreResult[List[FeedbackEvent]]:
+        result = self.get(user_id)
+        if not result.success:
+            return result
+        filtered = [
+            e for e in result.data.feedback_events
+            if e.goal_id == goal_id
+        ]
+        return StoreResult(success=True, data=filtered)
+
+
+===== storage\distilled_store.py =====
+# PATH: stride_backend/storage/distilled_store.py
+# DOMAIN: TinyDB persistence for distilled user model and priority list.
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, timezone
+from typing import Any
+
+from tinydb import TinyDB, Query
+
+from core.schemas.entities import DistilledModel, PriorityList
+from storage.store_types import StoreError, StoreResult
+
+_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?")
+
+
+class DistilledStore:
+    def __init__(self, db: TinyDB) -> None:
+        self._model_table = db.table("distilled_models")
+        self._priority_table = db.table("priority_lists")
+
+    def _serialise(self, data: Any) -> Any:
+        if isinstance(data, datetime):
+            return data.isoformat()
+        if isinstance(data, dict):
+            return {k: self._serialise(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._serialise(item) for item in data]
+        return data
+
+    def _deserialise(self, data: Any) -> Any:
+        if isinstance(data, str) and _ISO_RE.match(data):
+            try:
+                return datetime.fromisoformat(data)
+            except ValueError:
+                return data
+        if isinstance(data, dict):
+            return {k: self._deserialise(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._deserialise(item) for item in data]
+        return data
+
+    # ── DistilledModel ─────────────────────────────────────────────────────────
+
+    def get_model(self, user_id: str) -> StoreResult[DistilledModel]:
+        try:
+            Q = Query()
+            doc = self._model_table.get(Q.user_id == user_id)
+            if doc is None:
+                return StoreResult(
+                    success=False,
+                    error=StoreError(
+                        code="NOT_FOUND",
+                        message=f"No DistilledModel for user {user_id}",
+                        operation="get_model",
+                    ),
+                )
+            model = DistilledModel(**self._deserialise(dict(doc)))
+            return StoreResult(success=True, data=model)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR", message=str(e), operation="get_model"
+                ),
+            )
+
+    def write_model(self, model: DistilledModel) -> StoreResult[None]:
+        try:
+            model.distillation_version += 1
+            model.last_distilled_at = datetime.now(timezone.utc)
+            serialised = self._serialise(model.model_dump())
+            Q = Query()
+            self._model_table.upsert(serialised, Q.user_id == model.user_id)
+            return StoreResult(success=True, data=None)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="WRITE_ERROR", message=str(e), operation="write_model"
+                ),
+            )
+
+    def get_model_snapshot(self, user_id: str) -> StoreResult[DistilledModel]:
+        """
+        Returns the DistilledModel directly as snapshot.
+        ModelAgentExecutor passes this to LLM prompts via model_dump().
+        """
+        return self.get_model(user_id)
+
+    def write_model_snapshot(self, model: DistilledModel) -> StoreResult[None]:
+        """Alias for write_model — used by executor after weekly guidance."""
+        return self.write_model(model)
+
+    def initialise_user(self, user_id: str) -> StoreResult[None]:
+        existing = self.get_model(user_id)
+        if existing.success:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="ALREADY_EXISTS",
+                    message=f"DistilledModel already exists for user {user_id}",
+                    operation="initialise_user",
+                ),
+            )
+
+        model = DistilledModel(
+            user_id=user_id,
+            notes=None,
+            distillation_version=0,
+            last_distilled_at=datetime.now(timezone.utc),
+        )
+
+        priority_list = PriorityList(
+            user_id=user_id,
+            ranked_goals=[],
+            last_updated=datetime.now(timezone.utc),
+        )
+
+        model_result = self.write_model(model)
+        if not model_result.success:
+            return model_result
+
+        return self.write_priority_list(priority_list)
+
+    # ── PriorityList ───────────────────────────────────────────────────────────
+
+    def get_priority_list(self, user_id: str) -> StoreResult[PriorityList]:
+        try:
+            Q = Query()
+            doc = self._priority_table.get(Q.user_id == user_id)
+            if doc is None:
+                return StoreResult(
+                    success=False,
+                    error=StoreError(
+                        code="NOT_FOUND",
+                        message=f"No PriorityList for user {user_id}",
+                        operation="get_priority_list",
+                    ),
+                )
+            priority_list = PriorityList(**self._deserialise(dict(doc)))
+            return StoreResult(success=True, data=priority_list)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR", message=str(e), operation="get_priority_list"
+                ),
+            )
+
+    def write_priority_list(self, priority_list: PriorityList) -> StoreResult[None]:
+        try:
+            priority_list.last_updated = datetime.now(timezone.utc)
+            serialised = self._serialise(priority_list.model_dump())
+            Q = Query()
+            self._priority_table.upsert(
+                serialised, Q.user_id == priority_list.user_id
+            )
+            return StoreResult(success=True, data=None)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="WRITE_ERROR", message=str(e), operation="write_priority_list"
+                ),
+            )
+
+
+===== agents\model_agent\executor.py =====
+# PATH: stride_backend/agents/model_agent/executor.py
+# DOMAIN: ModelAgentExecutor — sole writer across all stores.
+# Handles post-creation flows: edits, weekly guidance, distillation, feedback.
+
+from __future__ import annotations
+
+import sys
+from datetime import datetime, timezone
+from typing import Optional
+from uuid import uuid4
+
+from langchain_openai import ChatOpenAI
+
+from agents.model_agent.prompts import (
+    GOAL_EDIT_NEGOTIATION_PROMPT,
+    TASK_EDIT_NEGOTIATION_PROMPT,
+    TIMETABLE_EDIT_NEGOTIATION_PROMPT,
+    WEEKLY_GUIDANCE_PROMPT,
+    GoalEditNegotiationOutput,
+    TaskEditNegotiationOutput,
+    TimetableEditNegotiationOutput,
+    WeeklyGuidanceOutput,
+)
+from core.schemas.contracts.execution_engine import WeeklyAggregatedSummary
+from core.schemas.contracts.feedback_loop import Boundary3Input, Boundary3Output
+from core.schemas.contracts.shared import BoundaryError
+from core.schemas.entities import (
+    FeedbackEvent,
+    GoalStatus,
+    PhaseTransition,
+    Task,
+    TaskStatus,
+)
+from storage.distilled_store import DistilledStore
+from storage.goal_store import GoalStore
+from storage.raw_store import RawStore
+
+
+# ── Retry helper ───────────────────────────────────────────────────────────────
+
+async def _invoke_with_retries(chain, inputs: dict, retries: int = 3):
+    last_exc = None
+    for _ in range(retries):
+        try:
+            return await chain.ainvoke(inputs)
+        except Exception as e:
+            last_exc = e
+    raise last_exc
+
+
+# ── Executor ───────────────────────────────────────────────────────────────────
+
+class ModelAgentExecutor:
+    """
+    Sole writer across all stores.
+    Handles all post-creation flows:
+      - Edit negotiation (goal, task, timetable, milestone)
+      - Task completion processing
+      - Weekly guidance and distillation
+    """
+
+    def __init__(
+        self,
+        raw_store: RawStore,
+        distilled_store: DistilledStore,
+        goal_store: GoalStore,
+        llm: ChatOpenAI,
+    ) -> None:
+        self._raw_store = raw_store
+        self._distilled_store = distilled_store
+        self._goal_store = goal_store
+        self._llm = llm
+
+    # ── 1. negotiate_goal_edit ─────────────────────────────────────────────────
+
+    async def negotiate_goal_edit(
+        self,
+        user_id: str,
+        goal_id: str,
+        proposed_edit: str,
+        user_response: str,
+    ) -> GoalEditNegotiationOutput:
+
+        goal_result = self._goal_store.get_goal(user_id, goal_id)
+        if not goal_result.success:
+            return GoalEditNegotiationOutput(
+                edit_accepted=False,
+                override_flag=False,
+                edit_summary="Goal lookup failed.",
+                pushback_rationale=goal_result.error.message,
+            )
+
+        snapshot_result = self._distilled_store.get_model_snapshot(user_id)
+        if not snapshot_result.success:
+            return GoalEditNegotiationOutput(
+                edit_accepted=False,
+                override_flag=False,
+                edit_summary="Distilled model lookup failed.",
+                pushback_rationale=snapshot_result.error.message,
+            )
+
+        chain = GOAL_EDIT_NEGOTIATION_PROMPT | self._llm.with_structured_output(
+            GoalEditNegotiationOutput
+        )
+
+        try:
+            output: GoalEditNegotiationOutput = await _invoke_with_retries(chain, {
+                "current_goal":            goal_result.data.model_dump(),
+                "proposed_edit":           proposed_edit,
+                "user_response":           user_response,
+                "distilled_model_snapshot": snapshot_result.data.model_dump(),
+            })
+        except Exception as e:
+            return GoalEditNegotiationOutput(
+                edit_accepted=False,
+                override_flag=False,
+                edit_summary="LLM chain failed after 3 retries.",
+                pushback_rationale=str(e),
+            )
+
+        if output.edit_accepted and output.revised_goal_description:
+            goal = goal_result.data
+            goal.name = output.revised_goal_description
+            self._goal_store.upsert_goal(goal)
+
+        if output.override_flag:
+            self._write_phase_transition(
+                user_id=user_id,
+                goal_id=goal_id,
+                reason=output.override_reason or "User override on goal edit.",
+                from_status=goal_result.data.status,
+                to_status=goal_result.data.status,
+            )
+
+        return output
+
+    # ── 2. negotiate_task_edit ─────────────────────────────────────────────────
+
+    async def negotiate_task_edit(
+        self,
+        user_id: str,
+        task_id: str,
+        proposed_edit: str,
+        user_response: str,
+    ) -> TaskEditNegotiationOutput:
+
+        task_result = self._goal_store.get_task(task_id)
+        if not task_result.success:
+            return TaskEditNegotiationOutput(
+                edit_accepted=False,
+                override_flag=False,
+                edit_summary="Task lookup failed.",
+                pushback_rationale=task_result.error.message,
+            )
+
+        task = task_result.data
+        goal_result = self._goal_store.get_goal(user_id, task.goal_id)
+        goal_context = (
+            goal_result.data.name if goal_result.success
+            else "Goal context unavailable."
+        )
+
+        snapshot_result = self._distilled_store.get_model_snapshot(user_id)
+        if not snapshot_result.success:
+            return TaskEditNegotiationOutput(
+                edit_accepted=False,
+                override_flag=False,
+                edit_summary="Distilled model lookup failed.",
+                pushback_rationale=snapshot_result.error.message,
+            )
+
+        chain = TASK_EDIT_NEGOTIATION_PROMPT | self._llm.with_structured_output(
+            TaskEditNegotiationOutput
+        )
+
+        try:
+            output: TaskEditNegotiationOutput = await _invoke_with_retries(chain, {
+                "current_task":            task.model_dump(),
+                "proposed_edit":           proposed_edit,
+                "user_response":           user_response,
+                "goal_context":            goal_context,
+                "distilled_model_snapshot": snapshot_result.data.model_dump(),
+            })
+        except Exception as e:
+            return TaskEditNegotiationOutput(
+                edit_accepted=False,
+                override_flag=False,
+                edit_summary="LLM chain failed after 3 retries.",
+                pushback_rationale=str(e),
+            )
+
+        if output.edit_accepted and output.revised_task_description:
+            task.description = output.revised_task_description
+            self._goal_store.upsert_task(task)
+
+        if output.override_flag:
+            self._write_phase_transition(
+                user_id=user_id,
+                goal_id=task.goal_id,
+                reason=output.override_reason or "User override on task edit.",
+                from_status=GoalStatus.ACTIVE,
+                to_status=GoalStatus.ACTIVE,
+            )
+
+        return output
+
+    # ── 3. negotiate_timetable_edit ────────────────────────────────────────────
+
+    async def negotiate_timetable_edit(
+        self,
+        user_id: str,
+        proposed_edit: str,
+        user_response: str,
+        current_timetable_summary: str,
+    ) -> TimetableEditNegotiationOutput:
+
+        snapshot_result = self._distilled_store.get_model_snapshot(user_id)
+        if not snapshot_result.success:
+            return TimetableEditNegotiationOutput(
+                edit_accepted=False,
+                priority_conflict_flagged=False,
+                override_flag=False,
+                edit_summary="Distilled model lookup failed.",
+                pushback_rationale=snapshot_result.error.message,
+            )
+
+        priority_result = self._distilled_store.get_priority_list(user_id)
+        priority_snapshot = (
+            priority_result.data.model_dump()
+            if priority_result.success else {}
+        )
+
+        chain = TIMETABLE_EDIT_NEGOTIATION_PROMPT | self._llm.with_structured_output(
+            TimetableEditNegotiationOutput
+        )
+
+        try:
+            output: TimetableEditNegotiationOutput = await _invoke_with_retries(chain, {
+                "current_timetable_summary": current_timetable_summary,
+                "proposed_edit":            proposed_edit,
+                "user_response":            user_response,
+                "distilled_model_snapshot": snapshot_result.data.model_dump(),
+                "priority_list_snapshot":   priority_snapshot,
+            })
+        except Exception as e:
+            return TimetableEditNegotiationOutput(
+                edit_accepted=False,
+                priority_conflict_flagged=False,
+                override_flag=False,
+                edit_summary="LLM chain failed after 3 retries.",
+                pushback_rationale=str(e),
+            )
+
+        if output.override_flag and output.priority_conflict_flagged:
+            if priority_result.success:
+                self._distilled_store.write_priority_list(priority_result.data)
+            self._write_phase_transition(
+                user_id=user_id,
+                goal_id="timetable",
+                reason="User override on timetable edit with priority conflict.",
+                from_status=GoalStatus.ACTIVE,
+                to_status=GoalStatus.ACTIVE,
+            )
+
+        return output
+
+    # ── 4. process_task_completion ─────────────────────────────────────────────
+
+    async def process_task_completion(
+        self,
+        boundary_input: Boundary3Input,
+    ) -> Boundary3Output:
+        """
+        Write feedback event to RawStore first.
+        Then update task status to COMPLETED in GoalStore.
+        No significance check in v1 — weekly distillation only.
+        """
+        event = FeedbackEvent(
+            id=str(uuid4()),
+            task_id=boundary_input.task_id,
+            goal_id=boundary_input.goal_id,
+            user_id=boundary_input.user_id,
+            milestone_id=boundary_input.milestone_id,
+            completed_at=datetime.fromisoformat(boundary_input.completion_timestamp),
+            note=boundary_input.user_note,
+            significance_check_triggered=False,
+        )
+
+        # Write event first — always
+        write_result = self._raw_store.append_feedback_event(
+            boundary_input.user_id, event
+        )
+        if not write_result.success:
+            return Boundary3Output(
+                user_id=boundary_input.user_id,
+                task_id=boundary_input.task_id,
+                success=False,
+                error=BoundaryError(
+                    code="WRITE_ERROR",
+                    message=write_result.error.message,
+                    component="ModelAgentExecutor",
+                    retry_count=0,
+                ),
+            )
+
+        # Update task status
+        task_update = self._goal_store.update_task_status(
+            boundary_input.task_id, TaskStatus.COMPLETED
+        )
+        if not task_update.success:
+            return Boundary3Output(
+                user_id=boundary_input.user_id,
+                task_id=boundary_input.task_id,
+                success=False,
+                error=BoundaryError(
+                    code="WRITE_ERROR",
+                    message=task_update.error.message,
+                    component="ModelAgentExecutor",
+                    retry_count=0,
+                ),
+            )
+
+        return Boundary3Output(
+            user_id=boundary_input.user_id,
+            task_id=boundary_input.task_id,
+            success=True,
+            error=None,
+        )
+
+    # ── 5. get_weekly_guidance ─────────────────────────────────────────────────
+
+    async def get_weekly_guidance(
+        self,
+        user_id: str,
+        weekly_summary: WeeklyAggregatedSummary,
+    ) -> WeeklyGuidanceOutput:
+        """
+        Receive pre-aggregated weekly summary from Python.
+        Generate qualitative guidance text.
+        Run weekly distillation — update DistilledModel.
+        """
+        active_goals_result = self._goal_store.get_active_goals(user_id)
+        active_goals = (
+            [g.model_dump() for g in active_goals_result.data]
+            if active_goals_result.success else []
+        )
+
+        priority_result = self._distilled_store.get_priority_list(user_id)
+        priority_snapshot = (
+            priority_result.data.model_dump()
+            if priority_result.success else {}
+        )
+
+        chain = WEEKLY_GUIDANCE_PROMPT | self._llm.with_structured_output(
+            WeeklyGuidanceOutput
+        )
+
+        try:
+            output: WeeklyGuidanceOutput = await _invoke_with_retries(chain, {
+                "user_id":              user_id,
+                "weekly_summary":       weekly_summary.model_dump(),
+                "active_goals":         active_goals,
+                "priority_list_snapshot": priority_snapshot,
+            })
+        except Exception as e:
+            return WeeklyGuidanceOutput(
+                guidance_type="check_in_prompt",
+                recommendations=[],
+                thin_input_flag=True,
+                reasoning_summary="LLM chain failed after 3 retries.",
+                check_in_prompt="How are you getting on with your goals this week?",
+            )
+
+        # Update DistilledModel with latest active goals
+        snapshot_result = self._distilled_store.get_model_snapshot(user_id)
+        if snapshot_result.success:
+            snapshot = snapshot_result.data
+            self._distilled_store.write_model_snapshot(snapshot)
+
+        return output
+
+    # ── Private helpers ────────────────────────────────────────────────────────
+
+    def _write_phase_transition(
+        self,
+        user_id: str,
+        goal_id: str,
+        reason: str,
+        from_status: GoalStatus,
+        to_status: GoalStatus,
+    ) -> None:
+        transition = PhaseTransition(
+            id=str(uuid4()),
+            goal_id=goal_id,
+            user_id=user_id,
+            from_status=from_status.value,
+            to_status=to_status.value,
+            transitioned_at=datetime.now(timezone.utc),
+            reason=reason,
+        )
+        self._raw_store.append_phase_transition(user_id, transition)
+
+
+===== C:\Users\user\stride_backend\core\schemas\contracts\execution_engine.py =====
+# PATH: stride_backend/core/schemas/contracts/execution_engine.py
+from __future__ import annotations
+from datetime import date
+from typing import List, Optional
+from pydantic import BaseModel
+from core.schemas.contracts.shared import BoundaryError
+from core.schemas.enums import EnergyLevel, TaskTag
+from core.schemas.entities import Task
+
+# ── Shared allocation data ─────────────────────────────────────────────────────
+class MilestoneAllocationData(BaseModel):
+    """Minimal milestone data passed to SchedulingComponent and SlotAllocator."""
+    milestone_id: str
+    tri_vector_weight: float
+    min_weekly_units: int
+    max_weekly_units: int
+    schema_version: int = 1
+
+# ── SchedulingComponent contracts ──────────────────────────────────────────────
+class SlotAllocationInput(BaseModel):
+    user_id: str
+    week_start: date
+    milestones: List[MilestoneAllocationData]   # was active_milestone_ids: List[str]
+    slot_grid: dict
+    notes: Optional[str] = None
+    schema_version: int = 1
+
+class DeepSessionPlan(BaseModel):
+    milestone_id: str
+    assigned_days: List[str]
+    sessions_planned: int
+    sessions_needed: int
+    partial_allocation: bool = False
+    schema_version: int = 1
+
+class SlotAllocationOutput(BaseModel):
+    user_id: str
+    week_start: date
+    deep_session_plans: List[DeepSessionPlan]
+    error: Optional[BoundaryError] = None
+    schema_version: int = 1
+
+# ── SlotAllocator contracts ────────────────────────────────────────────────────
+class QueuePullRequest(BaseModel):
+    user_id: str
+    current_energy_level: EnergyLevel
+    last_task_tag: Optional[TaskTag] = None
+    last_milestone_id: Optional[str] = None
+    consecutive_pull_count: int = 0
+    force_pull: bool = False
+    schema_version: int = 1
+
+class QueuePullResponse(BaseModel):
+    pulled_task: Optional[Task] = None
+    state_message: str
+    error: Optional[BoundaryError] = None
+    schema_version: int = 1
+
+# ── Weekly aggregation ─────────────────────────────────────────────────────────
+class MilestoneUtilization(BaseModel):
+    milestone_id: str
+    description: str
+    consumed_units: int
+    max_weekly_units: int
+    utilization_pct: float
+    below_floor: bool
+    schema_version: int = 1
+
+class WeeklyAggregatedSummary(BaseModel):
+    user_id: str
+    week_start: str
+    milestones_active: int
+    tasks_completed: int
+    tasks_stalled: int
+    deep_work_sessions: int
+    mechanical_bias_pct: float
+    milestone_utilization: List[MilestoneUtilization]
+    goals_below_floor: List[str]
+    schema_version: int = 1

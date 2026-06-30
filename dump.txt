@@ -1,0 +1,2519 @@
+================================================================================
+FILE: api\routes\goals.py
+================================================================================
+# PATH: stride_backend/api/routes/goals.py
+# DOMAIN: Goal creation and management API routes — Flow 1, Flow 5
+
+from __future__ import annotations
+
+import graphlib
+from datetime import date, datetime, timezone
+from math import floor
+from typing import Dict, List, Optional
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from agents.drafting_agent.agent import DraftingAgent
+from agents.smart_agent.agent import SmartAgent
+from agents.task_decomposer.agent import TaskDecomposer
+from api.dependencies import (
+    get_drafting_agent,
+    get_distilled_store,
+    get_goal_store,
+    get_onboarding_store,
+    get_raw_store,
+    get_scheduling_component,
+    get_smart_agent,
+    get_task_decomposer,
+)
+from core.config import DEEP_MIN_GAP_DAYS
+from core.scheduling.scheduling_component import SchedulingComponent
+from core.scheduling.tri_vector import compute_tri_vector_weights, derive_corridor
+from core.schemas.contracts.execution_engine import (
+    MilestoneAllocationData,
+    SlotAllocationInput,
+)
+from core.schemas.contracts.goal_drafting import (
+    DraftingInput,
+    DraftingOutput,
+    DraftingRevisionInput,
+)
+from core.schemas.contracts.goal_structuring import Boundary1Input
+from core.schemas.contracts.task_decomposition import TaskDecompositionInput
+from core.schemas.entities import (
+    Goal,
+    Milestone,
+    MilestoneStatus,
+    Task,
+    TaskStatus,
+)
+from core.schemas.enums import GoalStatus, TaskTag
+from storage.distilled_store import DistilledStore
+from storage.goal_store import GoalStore
+from storage.onboarding_store import OnboardingStore
+from storage.raw_store import RawStore
+
+router = APIRouter(prefix="/goals", tags=["goals"])
+
+
+# ── Request / Response models ──────────────────────────────────────────────────
+
+class DraftGoalRequest(BaseModel):
+    user_id: str
+    raw_goal: str
+    user_context: str
+
+
+class ReviseGoalDraftRequest(BaseModel):
+    user_id: str
+    previous_draft: dict
+    user_response: str
+
+
+class StructureGoalRequest(BaseModel):
+    user_id: str
+    confirmed_draft: dict
+    existing_goal_summaries: List[dict] = []
+
+
+class NegotiateStructureRequest(BaseModel):
+    user_id: str
+    confirmed_draft: dict
+    previous_assessment: dict
+    user_response: str
+    existing_goal_summaries: List[dict] = []
+
+
+class ConfirmGoalRequest(BaseModel):
+    user_id: str
+    confirmed_draft: dict
+    smart_assessment: dict          # Boundary1Output as dict
+    week_start: str                 # ISO date string
+
+
+class UpdateGoalRequest(BaseModel):
+    """Flow 5 — partial update. Optional fields left untouched if not provided."""
+    user_id: str
+    name: Optional[str] = None
+    macro_impact: Optional[int] = None        # 1-5
+    terminal_deadline: Optional[str] = None    # ISO date string
+    status: Optional[str] = None               # ACTIVE | PAUSED | COMPLETED
+
+
+class UpdateGoalResponse(BaseModel):
+    goal: dict                                  # updated Goal as dict
+    milestones_recomputed: List[str]            # milestone_ids whose weights changed
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _resolve_dependencies(tasks: List[Task]) -> List[Task]:
+    """
+    Map dependency descriptions to task_ids using TopologicalSorter.
+    Returns tasks with dependencies resolved to task_ids.
+    Raises HTTPException 400 if cycle detected.
+    """
+    desc_to_id = {t.description: t.task_id for t in tasks}
+
+    # Build dependency map using task_ids
+    dep_map: Dict[str, List[str]] = {}
+    for task in tasks:
+        resolved = []
+        for dep_desc in task.dependencies:
+            dep_id = desc_to_id.get(dep_desc)
+            if dep_id:
+                resolved.append(dep_id)
+        dep_map[task.task_id] = resolved
+        task.dependencies = resolved
+
+    # Validate — detect cycles
+    try:
+        sorter = graphlib.TopologicalSorter(dep_map)
+        sorter.prepare()
+    except graphlib.CycleError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Dependency cycle detected in task graph: {e}",
+        )
+
+    # Mark tasks with no unmet deps as AVAILABLE
+    tasks_with_deps = {tid for deps in dep_map.values() for tid in deps}
+    for task in tasks:
+        if not task.dependencies:
+            task.status = TaskStatus.AVAILABLE
+        else:
+            task.status = TaskStatus.PENDING
+
+    return tasks
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+
+@router.post("/draft")
+async def draft_goal(
+    request: DraftGoalRequest,
+    drafting_agent: DraftingAgent = Depends(get_drafting_agent),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+):
+    """
+    Flow 1 Step 1 — DraftingAgent converts raw goal text into structured draft.
+    """
+    snapshot_result = distilled_store.get_model(request.user_id)
+    snapshot = snapshot_result.data.model_dump() if snapshot_result.success else {}
+
+    drafting_input = DraftingInput(
+        user_id=request.user_id,
+        raw_goal=request.raw_goal,
+        user_context=request.user_context,
+        distilled_model_snapshot=snapshot,
+    )
+
+    output = await drafting_agent.draft_goal(drafting_input)
+
+    if output.error:
+        raise HTTPException(status_code=500, detail=output.error.message)
+
+    return output.model_dump()
+
+
+@router.post("/draft/revise")
+async def revise_goal_draft(
+    request: ReviseGoalDraftRequest,
+    drafting_agent: DraftingAgent = Depends(get_drafting_agent),
+):
+    """
+    Flow 1 — DraftingAgent revises draft based on user feedback.
+    """
+    previous_draft = DraftingOutput(**request.previous_draft)
+
+    revision_input = DraftingRevisionInput(
+        user_id=request.user_id,
+        previous_draft=previous_draft,
+        user_response=request.user_response,
+    )
+
+    output = await drafting_agent.revise_draft(revision_input)
+
+    if output.error:
+        raise HTTPException(status_code=500, detail=output.error.message)
+
+    return output.model_dump()
+
+
+@router.post("/structure")
+async def structure_goal(
+    request: StructureGoalRequest,
+    smart_agent: SmartAgent = Depends(get_smart_agent),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+):
+    """
+    Flow 1 Step 2 — SmartAgent fits confirmed draft to user context.
+    Returns SMART formulation, impact_score, extracted_deadline.
+    """
+    snapshot_result = distilled_store.get_model(request.user_id)
+    snapshot = snapshot_result.data.model_dump() if snapshot_result.success else {}
+
+    boundary_input = Boundary1Input(
+        user_id=request.user_id,
+        confirmed_draft=request.confirmed_draft,
+        distilled_model_snapshot=snapshot,
+        existing_goal_summaries=request.existing_goal_summaries,
+    )
+
+    output = await smart_agent.structure_goal(boundary_input)
+
+    if output.error:
+        raise HTTPException(status_code=500, detail=output.error.message)
+
+    return output.model_dump()
+
+
+@router.post("/structure/negotiate")
+async def negotiate_goal_structure(
+    request: NegotiateStructureRequest,
+    smart_agent: SmartAgent = Depends(get_smart_agent),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+):
+    """
+    Flow 1 — SmartAgent negotiates SMART formulation on user pushback.
+    """
+    snapshot_result = distilled_store.get_model(request.user_id)
+    snapshot = snapshot_result.data.model_dump() if snapshot_result.success else {}
+
+    boundary_input = Boundary1Input(
+        user_id=request.user_id,
+        confirmed_draft=request.confirmed_draft,
+        distilled_model_snapshot=snapshot,
+        existing_goal_summaries=request.existing_goal_summaries,
+    )
+
+    output = await smart_agent.negotiate_goal_creation(
+        input=boundary_input,
+        previous_assessment=request.previous_assessment,
+        user_response=request.user_response,
+    )
+
+    if output.error:
+        raise HTTPException(status_code=500, detail=output.error.message)
+
+    return output.model_dump()
+
+
+@router.post("/confirm")
+async def confirm_goal(
+    request: ConfirmGoalRequest,
+    task_decomposer: TaskDecomposer = Depends(get_task_decomposer),
+    scheduling_component: SchedulingComponent = Depends(get_scheduling_component),
+    goal_store: GoalStore = Depends(get_goal_store),
+    raw_store: RawStore = Depends(get_raw_store),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+    onboarding_store: OnboardingStore = Depends(get_onboarding_store),
+):
+    """
+    Flow 1 Step 3 — Confirm goal. Writes Goal + Milestones, runs TaskDecomposer,
+    runs SchedulingComponent, writes Tasks.
+    """
+    smart = request.smart_assessment
+    draft = request.confirmed_draft
+
+    # ── Capacity conflict check ────────────────────────────────────────────────
+    onboarding_result = onboarding_store.get_profile(request.user_id)
+    if not onboarding_result.success:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No OnboardingProfile found for this user. "
+                "Complete onboarding (POST /onboarding/profile) before "
+                "confirming a goal."
+            ),
+        )
+    max_workable_hours = onboarding_result.data.max_workable_hours
+
+# ── Build Goal entity ──────────────────────────────────────────────────────
+    # A goal with no extracted_deadline is valid — not every goal is
+    # deadline-bound (e.g. open-ended habits, identity-driven goals).
+    # terminal_deadline is still a required `date` field on the Goal schema
+    # (Tri-Vector urgency math needs SOME date), so absence of a real
+    # deadline maps to a far-future placeholder, landing permanently in the
+    # lowest urgency bracket (U=1.0, >90 days) rather than being rejected.
+    extracted_deadline = smart.get("extracted_deadline")
+    if extracted_deadline:
+        terminal_deadline = date.fromisoformat(extracted_deadline)
+    else:
+        terminal_deadline = date(2099, 12, 31)
+
+    goal_id = str(uuid4())
+    goal = Goal(
+        goal_id=goal_id,
+        user_id=request.user_id,
+        name=smart.get("smart_formulation", {}).get("specific", "Unnamed Goal"),
+        status=GoalStatus.ACTIVE,
+        macro_impact=smart.get("impact_score", 3),
+        terminal_deadline=terminal_deadline,
+    )
+
+    # ── Build Milestone entities (V=1.0 placeholder) ───────────────────────────
+    proposed_milestones = draft.get("proposed_milestones", [])
+    milestones: List[Milestone] = []
+    for pm in proposed_milestones:
+        milestones.append(Milestone(
+            milestone_id=str(uuid4()),
+            goal_id=goal_id,
+            user_id=request.user_id,
+            description=pm.get("description", ""),
+            objectives=pm.get("objectives", []),
+            success_metrics=draft.get("success_metrics", []),
+            tri_vector_weight=0.0,      # placeholder — computed after tasks
+            min_weekly_units=0,
+            max_weekly_units=0,
+            status=MilestoneStatus.STAGED,
+        ))
+
+    # ── Write Goal and Milestones ──────────────────────────────────────────────
+    goal_write = goal_store.upsert_goal(goal)
+    if not goal_write.success:
+        raise HTTPException(status_code=500, detail=goal_write.error.message)
+
+    for m in milestones:
+        m_write = goal_store.upsert_milestone(m)
+        if not m_write.success:
+            raise HTTPException(status_code=500, detail=m_write.error.message)
+
+    # ── Run TaskDecomposer per milestone ───────────────────────────────────────
+    task_graphs: Dict[str, List[Task]] = {}
+    for m in milestones:
+        decomp_input = TaskDecompositionInput(
+            milestone_id=m.milestone_id,
+            milestone_description=m.description,
+            objectives=m.objectives,
+            success_metrics=m.success_metrics,
+            previous_task_logs=[],
+        )
+        decomp_output = await task_decomposer.decompose(decomp_input)
+        if decomp_output.error:
+            raise HTTPException(
+                status_code=500, detail=decomp_output.error.message
+            )
+
+        # Build Task entities from drafts
+        tasks = [
+            Task(
+                task_id=str(uuid4()),
+                milestone_id=m.milestone_id,
+                goal_id=goal_id,
+                user_id=request.user_id,
+                description=td.description,
+                tag=td.tag,
+                dependencies=list(td.dependencies),
+                status=TaskStatus.PENDING,
+            )
+            for td in decomp_output.tasks
+        ]
+
+        # Resolve dependencies
+        tasks = _resolve_dependencies(tasks)
+        task_graphs[m.milestone_id] = tasks
+
+    # ── Recompute Tri-Vector with real V ───────────────────────────────────────
+    # Single-goal call: goals_by_id contains only this goal, so normalization
+    # scope is identical to pre-Brief-030 behavior. See
+    # core/scheduling/tri_vector.py for the cross-goal weekly-cycle call site.
+    weights = compute_tri_vector_weights(milestones, {goal.goal_id: goal}, task_graphs)
+
+    for m in milestones:
+        w = weights[m.milestone_id]
+        min_u, max_u = derive_corridor(w, max_workable_hours)
+        m.tri_vector_weight = w
+        m.min_weekly_units = min_u
+        m.max_weekly_units = max_u
+        m.status = MilestoneStatus.ACTIVE
+        goal_store.upsert_milestone(m)
+
+    # ── Write Tasks ────────────────────────────────────────────────────────────
+    for task_list in task_graphs.values():
+        for task in task_list:
+            t_write = goal_store.upsert_task(task)
+            if not t_write.success:
+                raise HTTPException(
+                    status_code=500, detail=t_write.error.message
+                )
+
+    # ── Run SchedulingComponent ────────────────────────────────────────────────
+    week_start = date.fromisoformat(request.week_start)
+
+    slot_grid_result = onboarding_store.get_slot_grid(request.user_id, week_start)
+    if not slot_grid_result.success:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No SlotGrid found for user {request.user_id}, week "
+                f"{week_start.isoformat()}. Onboarding may be incomplete, "
+                f"or this week's grid has not been generated."
+            ),
+        )
+    slot_grid = slot_grid_result.data
+
+    allocation_input = SlotAllocationInput(
+        user_id=request.user_id,
+        week_start=week_start,
+        milestones=[
+            MilestoneAllocationData(
+                milestone_id=m.milestone_id,
+                tri_vector_weight=m.tri_vector_weight,
+                min_weekly_units=m.min_weekly_units,
+                max_weekly_units=m.max_weekly_units,
+            )
+            for m in milestones
+        ],
+        slot_grid=slot_grid.model_dump(),
+        notes="goal confirmation",
+    )
+
+    allocation_output = scheduling_component.allocate_slots(allocation_input)
+
+    if allocation_output.error:
+        # Non-fatal — log and continue. Scheduling failure should not
+        # block goal creation.
+        pass
+
+    return {
+        "goal_id": goal_id,
+        "milestone_ids": [m.milestone_id for m in milestones],
+        "task_counts": {
+            mid: len(tasks) for mid, tasks in task_graphs.items()
+        },
+        "deep_session_plans": (
+            [p.model_dump() for p in allocation_output.deep_session_plans]
+            if not allocation_output.error else []
+        ),
+        "status": "confirmed",
+    }
+
+
+@router.patch("/{goal_id}")
+async def update_goal(
+    goal_id: str,
+    request: UpdateGoalRequest,
+    goal_store: GoalStore = Depends(get_goal_store),
+    onboarding_store: OnboardingStore = Depends(get_onboarding_store),
+):
+    """
+    Flow 5 — Goal Edit (CRUD). Pure Python, no LLM, no ModelAgentExecutor
+    (matches D-16, D-23). Partial update: only provided fields are changed.
+
+    If terminal_deadline or macro_impact changes, recomputes Tri-Vector
+    weights via core.scheduling.tri_vector.compute_tri_vector_weights —
+    the same shared function used by the weekly cycle (Brief 030) — across
+    ALL of the user's active milestones (cross-goal, globally normalized),
+    and writes back tri_vector_weight / min_weekly_units / max_weekly_units
+    for any milestone whose computed values actually changed.
+    """
+    # ── 1. Fetch existing Goal ───────────────────────────────────────────────
+    goal_result = goal_store.get_goal(request.user_id, goal_id)
+    if not goal_result.success:
+        raise HTTPException(status_code=404, detail=goal_result.error.message)
+    goal = goal_result.data
+
+    # ── 2. Validate provided fields ──────────────────────────────────────────
+    if request.macro_impact is not None:
+        if not (1 <= request.macro_impact <= 5):
+            raise HTTPException(
+                status_code=400,
+                detail="macro_impact must be between 1 and 5 inclusive.",
+            )
+
+    parsed_deadline: Optional[date] = None
+    if request.terminal_deadline is not None:
+        try:
+            parsed_deadline = date.fromisoformat(request.terminal_deadline)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"terminal_deadline {request.terminal_deadline!r} is not "
+                    "a valid ISO date (YYYY-MM-DD)."
+                ),
+            )
+
+    parsed_status: Optional[GoalStatus] = None
+    if request.status is not None:
+        try:
+            parsed_status = GoalStatus(request.status)
+        except ValueError:
+            valid = ", ".join(s.value for s in GoalStatus)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"status {request.status!r} is not a valid GoalStatus. "
+                    f"Valid values: {valid}"
+                ),
+            )
+
+    # ── 3. Apply only provided changes ───────────────────────────────────────
+    deadline_changed = False
+    impact_changed = False
+
+    if request.name is not None:
+        goal.name = request.name
+
+    if (
+        request.macro_impact is not None
+        and request.macro_impact != goal.macro_impact
+    ):
+        goal.macro_impact = request.macro_impact
+        impact_changed = True
+
+    if parsed_deadline is not None and parsed_deadline != goal.terminal_deadline:
+        goal.terminal_deadline = parsed_deadline
+        deadline_changed = True
+
+    if parsed_status is not None:
+        goal.status = parsed_status
+
+    # ── 4. Write updated Goal ────────────────────────────────────────────────
+    write_result = goal_store.upsert_goal(goal)
+    if not write_result.success:
+        raise HTTPException(status_code=500, detail=write_result.error.message)
+
+    # ── 5. Recompute Tri-Vector if terminal_deadline or macro_impact changed
+    recomputed_ids: List[str] = []
+
+    if deadline_changed or impact_changed:
+        milestones_result = goal_store.get_active_milestones_by_user(
+            request.user_id
+        )
+        if not milestones_result.success:
+            raise HTTPException(
+                status_code=500, detail=milestones_result.error.message
+            )
+        active_milestones = milestones_result.data
+
+        if active_milestones:
+            onboarding_result = onboarding_store.get_profile(request.user_id)
+            if not onboarding_result.success:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "No OnboardingProfile found for this user — required "
+                        "to recompute weekly unit corridors."
+                    ),
+                )
+            max_workable_hours = onboarding_result.data.max_workable_hours
+
+            # Rebuild task_graphs from storage (these milestones already
+            # have real tasks, unlike confirm_goal's freshly-decomposed set).
+            task_graphs: Dict[str, List[Task]] = {}
+            for m in active_milestones:
+                tasks_result = goal_store.get_tasks_by_milestone(
+                    m.milestone_id
+                )
+                if not tasks_result.success:
+                    raise HTTPException(
+                        status_code=500, detail=tasks_result.error.message
+                    )
+                task_graphs[m.milestone_id] = tasks_result.data
+
+            # Build goals_by_id for every distinct goal represented among
+            # this user's active milestones — compute_tri_vector_weights
+            # looks up I/U per-milestone via its own parent goal, but
+            # normalizes across the FULL milestones list passed in, so
+            # passing every active milestone for the user here gives true
+            # cross-goal normalization (same call shape as the weekly
+            # cycle in Brief 030).
+            goals_by_id: Dict[str, Goal] = {goal.goal_id: goal}
+            for m in active_milestones:
+                if m.goal_id not in goals_by_id:
+                    g_result = goal_store.get_goal(request.user_id, m.goal_id)
+                    if not g_result.success:
+                        raise HTTPException(
+                            status_code=500, detail=g_result.error.message
+                        )
+                    goals_by_id[m.goal_id] = g_result.data
+
+            all_weights = compute_tri_vector_weights(
+                active_milestones, goals_by_id, task_graphs
+            )
+
+            for m in active_milestones:
+                w = all_weights[m.milestone_id]
+                min_u, max_u = derive_corridor(w, max_workable_hours)
+                changed = (
+                    m.tri_vector_weight != w
+                    or m.min_weekly_units != min_u
+                    or m.max_weekly_units != max_u
+                )
+                m.tri_vector_weight = w
+                m.min_weekly_units = min_u
+                m.max_weekly_units = max_u
+                m_write = goal_store.upsert_milestone(m)
+                if not m_write.success:
+                    raise HTTPException(
+                        status_code=500, detail=m_write.error.message
+                    )
+                if changed:
+                    recomputed_ids.append(m.milestone_id)
+
+    # ── 6. Return ─────────────────────────────────────────────────────────────
+    return UpdateGoalResponse(
+        goal=goal.model_dump(),
+        milestones_recomputed=recomputed_ids,
+    )
+
+
+================================================================================
+FILE: storage\goal_store.py
+================================================================================
+# PATH: stride_backend/storage/goal_store.py
+# DOMAIN: TinyDB persistence for Goals, Milestones, and Tasks.
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, date, timezone
+from enum import Enum
+from typing import Any, List
+
+from tinydb import TinyDB, Query
+
+from core.schemas.entities import Goal, Milestone, Task
+from core.schemas.enums import GoalStatus, MilestoneStatus, TaskStatus
+from storage.store_types import StoreError, StoreResult
+
+_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class GoalStore:
+    def __init__(self, db: TinyDB) -> None:
+        self._goals = db.table("goals")
+        self._milestones = db.table("milestones")
+        self._tasks = db.table("tasks")
+
+    def _serialise(self, data: Any) -> Any:
+        if isinstance(data, datetime):
+            return data.isoformat()
+        if isinstance(data, date):
+            return data.isoformat()
+        if isinstance(data, Enum):
+            return data.value
+        if isinstance(data, dict):
+            return {k: self._serialise(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._serialise(item) for item in data]
+        return data
+
+    def _deserialise(self, data: Any) -> Any:
+        if isinstance(data, str) and _ISO_RE.match(data):
+            try:
+                return datetime.fromisoformat(data)
+            except ValueError:
+                return data
+        if isinstance(data, str) and _DATE_RE.match(data):
+            try:
+                return date.fromisoformat(data)
+            except ValueError:
+                return data
+        if isinstance(data, dict):
+            return {k: self._deserialise(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._deserialise(item) for item in data]
+        return data
+
+    # ── Goal methods ───────────────────────────────────────────────────────────
+
+    def get_goal(self, user_id: str, goal_id: str) -> StoreResult[Goal]:
+        try:
+            Q = Query()
+            doc = self._goals.get(
+                (Q.goal_id == goal_id) & (Q.user_id == user_id)
+            )
+            if doc is None:
+                return StoreResult(
+                    success=False,
+                    error=StoreError(
+                        code="NOT_FOUND",
+                        message=f"No Goal with goal_id {goal_id} for user {user_id}",
+                        operation="get_goal",
+                    ),
+                )
+            goal = Goal(**self._deserialise(dict(doc)))
+            return StoreResult(success=True, data=goal)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR", message=str(e), operation="get_goal"
+                ),
+            )
+
+    def get_goals_by_user(self, user_id: str) -> StoreResult[List[Goal]]:
+        try:
+            Q = Query()
+            docs = self._goals.search(Q.user_id == user_id)
+            goals = [Goal(**self._deserialise(dict(doc))) for doc in docs]
+            return StoreResult(success=True, data=goals)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR", message=str(e), operation="get_goals_by_user"
+                ),
+            )
+
+    def get_active_goals(self, user_id: str) -> StoreResult[List[Goal]]:
+        try:
+            Q = Query()
+            docs = self._goals.search(
+                (Q.user_id == user_id) & (Q.status == GoalStatus.ACTIVE.value)
+            )
+            goals = [Goal(**self._deserialise(dict(doc))) for doc in docs]
+            return StoreResult(success=True, data=goals)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR", message=str(e), operation="get_active_goals"
+                ),
+            )
+
+    def upsert_goal(self, goal: Goal) -> StoreResult[None]:
+        try:
+            serialised = self._serialise(goal.model_dump())
+            Q = Query()
+            self._goals.upsert(serialised, Q.goal_id == goal.goal_id)
+            return StoreResult(success=True, data=None)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="WRITE_ERROR", message=str(e), operation="upsert_goal"
+                ),
+            )
+
+    def update_goal_status(
+        self, goal_id: str, user_id: str, new_status: GoalStatus, reason: str
+    ) -> StoreResult[None]:
+        if not reason:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="INVALID_INPUT",
+                    message="reason must not be empty",
+                    operation="update_goal_status",
+                ),
+            )
+        result = self.get_goal(user_id, goal_id)
+        if not result.success:
+            return result
+        goal = result.data
+        goal.status = new_status
+        return self.upsert_goal(goal)
+
+    # ── Milestone methods ──────────────────────────────────────────────────────
+
+    def get_milestones_by_goal(self, goal_id: str) -> StoreResult[List[Milestone]]:
+        try:
+            Q = Query()
+            docs = self._milestones.search(Q.goal_id == goal_id)
+            milestones = [
+                Milestone(**self._deserialise(dict(doc))) for doc in docs
+            ]
+            return StoreResult(success=True, data=milestones)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR",
+                    message=str(e),
+                    operation="get_milestones_by_goal",
+                ),
+            )
+
+    def get_active_milestones_by_user(
+        self, user_id: str
+    ) -> StoreResult[List[Milestone]]:
+        try:
+            Q = Query()
+            docs = self._milestones.search(
+                (Q.user_id == user_id)
+                & (Q.status == MilestoneStatus.ACTIVE.value)
+            )
+            milestones = [
+                Milestone(**self._deserialise(dict(doc))) for doc in docs
+            ]
+            return StoreResult(success=True, data=milestones)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR",
+                    message=str(e),
+                    operation="get_active_milestones_by_user",
+                ),
+            )
+
+    def get_staged_milestones_by_user(
+        self, user_id: str
+    ) -> StoreResult[List[Milestone]]:
+        try:
+            Q = Query()
+            docs = self._milestones.search(
+                (Q.user_id == user_id)
+                & (Q.status == MilestoneStatus.STAGED.value)
+            )
+            milestones = [
+                Milestone(**self._deserialise(dict(doc))) for doc in docs
+            ]
+            return StoreResult(success=True, data=milestones)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR",
+                    message=str(e),
+                    operation="get_staged_milestones_by_user",
+                ),
+            )
+
+    def upsert_milestone(self, milestone: Milestone) -> StoreResult[None]:
+        try:
+            serialised = self._serialise(milestone.model_dump())
+            Q = Query()
+            self._milestones.upsert(
+                serialised, Q.milestone_id == milestone.milestone_id
+            )
+            return StoreResult(success=True, data=None)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="WRITE_ERROR", message=str(e), operation="upsert_milestone"
+                ),
+            )
+
+    # ── Task methods ───────────────────────────────────────────────────────────
+
+    def get_task(self, task_id: str) -> StoreResult[Task]:
+        try:
+            Q = Query()
+            doc = self._tasks.get(Q.task_id == task_id)
+            if doc is None:
+                return StoreResult(
+                    success=False,
+                    error=StoreError(
+                        code="NOT_FOUND",
+                        message=f"No Task with task_id {task_id}",
+                        operation="get_task",
+                    ),
+                )
+            task = Task(**self._deserialise(dict(doc)))
+            return StoreResult(success=True, data=task)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR", message=str(e), operation="get_task"
+                ),
+            )
+
+    def get_tasks_by_milestone(
+        self, milestone_id: str
+    ) -> StoreResult[List[Task]]:
+        try:
+            Q = Query()
+            docs = self._tasks.search(Q.milestone_id == milestone_id)
+            tasks = [Task(**self._deserialise(dict(doc))) for doc in docs]
+            return StoreResult(success=True, data=tasks)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR",
+                    message=str(e),
+                    operation="get_tasks_by_milestone",
+                ),
+            )
+
+    def get_available_tasks_by_user(
+        self, user_id: str
+    ) -> StoreResult[List[Task]]:
+        """
+        Returns all AVAILABLE tasks for a user across all milestones.
+        Used by the API route to feed SlotAllocator.pull().
+        """
+        try:
+            Q = Query()
+            docs = self._tasks.search(
+                (Q.user_id == user_id)
+                & (Q.status == TaskStatus.AVAILABLE.value)
+            )
+            tasks = [Task(**self._deserialise(dict(doc))) for doc in docs]
+            return StoreResult(success=True, data=tasks)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR",
+                    message=str(e),
+                    operation="get_available_tasks_by_user",
+                ),
+            )
+
+    def upsert_task(self, task: Task) -> StoreResult[None]:
+        try:
+            serialised = self._serialise(task.model_dump())
+            Q = Query()
+            self._tasks.upsert(serialised, Q.task_id == task.task_id)
+            return StoreResult(success=True, data=None)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="WRITE_ERROR", message=str(e), operation="upsert_task"
+                ),
+            )
+
+    def update_task_status(
+        self, task_id: str, new_status: TaskStatus
+    ) -> StoreResult[None]:
+        result = self.get_task(task_id)
+        if not result.success:
+            return result
+        task = result.data
+        task.status = new_status
+        return self.upsert_task(task)
+
+    def get_tasks_by_user(self, user_id: str) -> StoreResult[List[Task]]:
+        try:
+            Q = Query()
+            docs = self._tasks.search(Q.user_id == user_id)
+            tasks = [Task(**self._deserialise(dict(doc))) for doc in docs]
+            return StoreResult(success=True, data=tasks)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR",
+                    message=str(e),
+                    operation="get_tasks_by_user",
+                ),
+            )
+
+
+================================================================================
+FILE: core\schemas\__init__.py
+================================================================================
+
+
+================================================================================
+FILE: core\schemas\entities.py
+================================================================================
+from __future__ import annotations
+from datetime import date, datetime
+from typing import List, Optional
+from pydantic import BaseModel, Field, field_validator
+
+from core.schemas.enums import (
+    TaskTag, TaskStatus, MilestoneStatus, GoalStatus, EnergyLevel
+)
+
+
+# ─────────────────────────────────────────────
+# GOAL
+# ─────────────────────────────────────────────
+
+class Goal(BaseModel):
+    goal_id: str
+    user_id: str
+    name: str
+    status: GoalStatus = GoalStatus.ACTIVE
+    macro_impact: int               # 1–5, cascades to child milestones as I
+    terminal_deadline: date         # Python uses this to compute U
+    schema_version: int = 2
+
+
+# ─────────────────────────────────────────────
+# MILESTONE
+# ─────────────────────────────────────────────
+
+class Milestone(BaseModel):
+    milestone_id: str
+    goal_id: str
+    user_id: str
+    description: str
+    objectives: List[str] = Field(default_factory=list)
+    success_metrics: List[str] = Field(default_factory=list)
+    tri_vector_weight: float = 0.0          # computed by Python, not LLM
+    min_weekly_units: int = 0               # floor — derived from weight
+    max_weekly_units: int = 0               # ceiling — derived from weight
+    status: MilestoneStatus = MilestoneStatus.DRAFT
+    schema_version: int = 2
+
+
+# ─────────────────────────────────────────────
+# TASK
+# ─────────────────────────────────────────────
+
+class Task(BaseModel):
+    task_id: str
+    milestone_id: str
+    goal_id: str
+    user_id: str
+    description: str
+    tag: TaskTag
+    dependencies: List[str] = Field(default_factory=list)  # list of task_ids
+    status: TaskStatus = TaskStatus.PENDING
+    stalled_flag: bool = False
+    schema_version: int = 2
+
+    # NOTE: No slot_units field. Slot cost derived at runtime:
+    # MECHANICAL=1, MODERATE=2, DEEP=4 (from config.SLOT_UNIT_CONSTANTS)
+
+
+# ─────────────────────────────────────────────
+# SLOT GRID
+# ─────────────────────────────────────────────
+
+class TimeSlot(BaseModel):
+    day: str                        # e.g. "Monday"
+    start_time: str                 # e.g. "09:00"
+    energy_level: EnergyLevel
+
+
+class SlotGrid(BaseModel):
+    user_id: str
+    week_start: date
+    slots: List[TimeSlot] = Field(default_factory=list)
+    schema_version: int = 1
+
+    # NOTE: SlotGrid holds NO task IDs.
+    # It is an energy index — describes the user's week, not their schedule.
+
+
+# ─────────────────────────────────────────────
+# ONBOARDING PROFILE
+# ─────────────────────────────────────────────
+
+class EnergyBlock(BaseModel):
+    label: str                  # user-defined free text, e.g. "morning", "post-lunch slump"
+    start_time: str             # "HH:MM" 24hr format
+    end_time: str               # "HH:MM" 24hr format, must be > start_time
+    energy_level: EnergyLevel   # HIGH | MEDIUM | LOW
+
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def validate_time_format(cls, v: str) -> str:
+        import re
+        if not re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", v):
+            raise ValueError(f"Invalid HH:MM time format: {v}")
+        return v
+
+
+class OnboardingProfile(BaseModel):
+    user_id: str
+    max_workable_hours: float                   # hard weekly cap
+    weekday_blocks: List[EnergyBlock]            # applied Mon-Fri
+    weekend_blocks: List[EnergyBlock]            # applied Sat-Sun. Client sends
+                                                  # matching blocks for both if user
+                                                  # wants no weekday/weekend difference
+                                                  # — this is a user decision, not a
+                                                  # system default. Never silently
+                                                  # duplicated server-side.
+    schema_version: int = 3
+
+
+# ─────────────────────────────────────────────
+# RAW STORE ENTITIES
+# ─────────────────────────────────────────────
+
+class FeedbackEvent(BaseModel):
+    id: str
+    task_id: str
+    goal_id: str
+    milestone_id: str
+    user_id: str
+    completed_at: datetime
+    note: Optional[str] = None
+    significance_check_triggered: bool = False
+    schema_version: int = 1
+
+
+class PhaseTransition(BaseModel):
+    id: str
+    goal_id: str
+    user_id: str
+    from_status: str
+    to_status: str
+    transitioned_at: datetime
+    reason: str
+    schema_version: int = 1
+
+
+class RawUserModel(BaseModel):
+    user_id: str
+    feedback_events: List[FeedbackEvent] = Field(default_factory=list)
+    phase_transitions: List[PhaseTransition] = Field(default_factory=list)
+    last_updated: datetime
+    schema_version: int = 1
+
+
+# ─────────────────────────────────────────────
+# DISTILLED STORE ENTITIES
+# ─────────────────────────────────────────────
+
+class PriorityEntry(BaseModel):
+    goal_id: str
+    goal_name: str
+    weight: float                   # tri_vector_weight — used for ordering
+    schema_version: int = 1
+
+
+class PriorityList(BaseModel):
+    user_id: str
+    ranked_goals: List[PriorityEntry] = Field(default_factory=list)
+    last_updated: datetime
+    schema_version: int = 1
+
+
+class DistilledModel(BaseModel):
+    user_id: str
+    notes: Optional[str] = None     # free-form coaching notes from weekly guidance
+    distillation_version: int = 0   # incremented on each write
+    last_distilled_at: Optional[datetime] = None
+    schema_version: int = 1
+
+
+================================================================================
+FILE: core\schemas\enums.py
+================================================================================
+from enum import Enum
+
+
+class TaskTag(str, Enum):
+    DEEP = "DEEP"               # 4 slot units = 100 minutes
+    MODERATE = "MODERATE"       # 2 slot units = 50 minutes
+    MECHANICAL = "MECHANICAL"   # 1 slot unit  = 25 minutes
+
+
+class TaskStatus(str, Enum):
+    PENDING = "PENDING"         # blocked by unmet dependencies
+    AVAILABLE = "AVAILABLE"     # dependencies met, ready for pull
+    COMPLETED = "COMPLETED"
+    SUPERSEDED = "SUPERSEDED"   # replaced by breakdown tasks
+
+
+class MilestoneStatus(str, Enum):
+    DRAFT = "DRAFT"
+    STAGED = "STAGED"           # approved, waiting for capacity or epoch boundary
+    ACTIVE = "ACTIVE"
+    COMPLETED = "COMPLETED"
+
+
+class GoalStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    PAUSED = "PAUSED"
+    COMPLETED = "COMPLETED"
+
+
+class EnergyLevel(str, Enum):
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+
+
+class SelfEfficacyLevel(str, Enum):
+    LOW = "low"
+    MODERATE = "moderate"
+    HIGH = "high"
+
+
+================================================================================
+FILE: core\schemas\contracts\shared.py
+================================================================================
+from typing import Optional
+from pydantic import BaseModel
+
+
+class BoundaryError(BaseModel):
+    code: str
+    message: str
+    component: str          # which agent or component raised this
+    retry_count: int = 0    # how many times this boundary has been retried
+    schema_version: int = 2
+
+
+# ─────────────────────────────────────────────
+# SHARED TYPES (used across multiple contracts)
+# ─────────────────────────────────────────────
+
+class GoalSummary(BaseModel):
+    goal_id: str
+    name: str
+    macro_impact: int
+    terminal_deadline: str      # ISO string
+    status: str
+    schema_version: int = 2
+
+
+class MilestoneSummary(BaseModel):
+    milestone_id: str
+    goal_id: str
+    description: str
+    tri_vector_weight: float
+    min_weekly_units: int
+    status: str
+    schema_version: int = 2
+
+
+class CompletedTaskSummary(BaseModel):
+    task_id: str
+    description: str
+    tag: str
+    completed_at: str           # ISO string
+    schema_version: int = 2
+
+
+================================================================================
+FILE: core\schemas\contracts\goal_structuring.py
+================================================================================
+from typing import List, Optional
+from pydantic import BaseModel
+
+from core.schemas.contracts.shared import BoundaryError, GoalSummary
+
+
+class SmartFormulation(BaseModel):
+    specific: str
+    measurable: str
+    achievable: str
+    relevant: str
+    time_bound: str
+    schema_version: int = 2
+
+
+class Boundary1Input(BaseModel):
+    user_id: str
+    confirmed_draft: dict  # DraftingOutput passed as dict
+    distilled_model_snapshot: dict
+    existing_goal_summaries: List[GoalSummary] = []
+    schema_version: int = 2
+
+
+class Boundary1Output(BaseModel):
+    user_id: str
+    smart_formulation: SmartFormulation
+    impact_score: int  # 1–5; SmartAgent assigns, Python uses as I
+    extracted_deadline: Optional[str] = None  # ISO date string; SmartAgent extracts.
+    # None is valid — not every goal has a
+    # deadline. confirm_goal already handles
+    # this explicitly (400 if missing when required).    viability_assessment: str
+    conflict_flag: bool = False
+    override_flag: bool = False
+    override_reason: Optional[str] = None
+    error: Optional[BoundaryError] = None
+    schema_version: int = 2
+
+
+
+================================================================================
+FILE: core\schemas\contracts\goal_drafting.py
+================================================================================
+from typing import List, Optional
+from pydantic import BaseModel
+
+from core.schemas.enums import TaskTag
+from core.schemas.contracts.shared import BoundaryError, CompletedTaskSummary
+
+
+class ProposedMilestone(BaseModel):
+    description: str
+    objectives: List[str]
+    suggested_tag: TaskTag          # predominant task type expected in this milestone
+    schema_version: int = 1
+
+
+class DraftingInput(BaseModel):
+    user_id: str
+    raw_goal: str
+    user_context: str               # brief profile summary
+    distilled_model_snapshot: dict
+    schema_version: int = 1
+
+
+class DraftingOutput(BaseModel):
+    user_id: str
+    objectives: List[str]
+    proposed_milestones: List[ProposedMilestone]
+    success_metrics: List[str]
+    error: Optional[BoundaryError] = None
+    schema_version: int = 1
+
+
+class DraftingRevisionInput(BaseModel):
+    user_id: str
+    previous_draft: DraftingOutput
+    user_response: str
+    schema_version: int = 1
+
+
+================================================================================
+FILE: core\schemas\contracts\goal_scheduling.py
+================================================================================
+# PATH: stride_backend/core/schemas/contracts/goal_scheduling.py
+# DOMAIN: Pydantic schemas for SRSH Boundary 2 — scheduling and task decomposition.
+
+from __future__ import annotations
+from datetime import datetime, date
+from typing import List, Optional
+from pydantic import BaseModel
+
+from core.schemas.entities import SmartFormulation, CapacityIndicators, PriorityEntry
+from core.schemas.contracts.shared import BoundaryError
+from stride_backend.core.schemas.contracts.goal_structuring import GoalSummary
+
+
+class PriorityListSnapshot(BaseModel):
+    ranked_goals: List[PriorityEntry]
+    last_updated: datetime
+
+
+class ScheduledTask(BaseModel):
+    description: str
+    goal_id: str
+    scheduled_date: date
+    scheduled_time_window: str
+    estimated_duration_minutes: int
+
+
+class TimetableOutput(BaseModel):
+    tasks: List[ScheduledTask]
+
+
+class Boundary2Input(BaseModel):
+    user_id: str
+    approved_goal: GoalSummary
+    smart_formulation: SmartFormulation
+    priority_list_snapshot: PriorityListSnapshot
+    availability_windows: List[str]
+    capacity_indicators: CapacityIndicators
+    distillation_version_used: int
+    calibration_period_active: bool
+
+
+class Boundary2Output(BaseModel):
+    user_id: str
+    goal_id: str
+    timetable: TimetableOutput
+    conflicts_resolved: List[str]
+    generated_by_distillation_version: int
+    error: Optional[BoundaryError] = None
+
+
+================================================================================
+FILE: core\schemas\contracts\execution_engine.py
+================================================================================
+# PATH: stride_backend/core/schemas/contracts/execution_engine.py
+from __future__ import annotations
+from datetime import date
+from typing import List, Optional
+from pydantic import BaseModel
+from core.schemas.contracts.shared import BoundaryError
+from core.schemas.enums import EnergyLevel, TaskTag
+from core.schemas.entities import Task
+
+# ── Shared allocation data ─────────────────────────────────────────────────────
+class MilestoneAllocationData(BaseModel):
+    """Minimal milestone data passed to SchedulingComponent and SlotAllocator."""
+    milestone_id: str
+    tri_vector_weight: float
+    min_weekly_units: int
+    max_weekly_units: int
+    schema_version: int = 1
+
+# ── SchedulingComponent contracts ──────────────────────────────────────────────
+class SlotAllocationInput(BaseModel):
+    user_id: str
+    week_start: date
+    milestones: List[MilestoneAllocationData]   # was active_milestone_ids: List[str]
+    slot_grid: dict
+    notes: Optional[str] = None
+    schema_version: int = 1
+
+class DeepSessionPlan(BaseModel):
+    milestone_id: str
+    assigned_days: List[str]
+    sessions_planned: int
+    sessions_needed: int
+    partial_allocation: bool = False
+    schema_version: int = 1
+
+class SlotAllocationOutput(BaseModel):
+    user_id: str
+    week_start: date
+    deep_session_plans: List[DeepSessionPlan]
+    error: Optional[BoundaryError] = None
+    schema_version: int = 1
+
+# ── SlotAllocator contracts ────────────────────────────────────────────────────
+class QueuePullRequest(BaseModel):
+    user_id: str
+    current_energy_level: EnergyLevel
+    last_task_tag: Optional[TaskTag] = None
+    last_milestone_id: Optional[str] = None
+    consecutive_pull_count: int = 0
+    force_pull: bool = False
+    schema_version: int = 1
+
+class QueuePullResponse(BaseModel):
+    pulled_task: Optional[Task] = None
+    state_message: str
+    error: Optional[BoundaryError] = None
+    schema_version: int = 1
+
+# ── Weekly aggregation ─────────────────────────────────────────────────────────
+class MilestoneUtilization(BaseModel):
+    milestone_id: str
+    description: str
+    consumed_units: int
+    max_weekly_units: int
+    utilization_pct: float
+    below_floor: bool
+    schema_version: int = 1
+
+class WeeklyAggregatedSummary(BaseModel):
+    user_id: str
+    week_start: str
+    milestones_active: int
+    tasks_completed: int
+    tasks_stalled: int
+    deep_work_sessions: int
+    mechanical_bias_pct: float
+    milestone_utilization: List[MilestoneUtilization]
+    goals_below_floor: List[str]
+    schema_version: int = 1
+
+
+================================================================================
+FILE: core\schemas\contracts\feedback_loop.py
+================================================================================
+from typing import Optional
+from pydantic import BaseModel
+
+from core.schemas.contracts.shared import BoundaryError
+
+
+class Boundary3Input(BaseModel):
+    user_id: str
+    task_id: str
+    goal_id: str
+    milestone_id: str
+    completion_timestamp: str       # ISO datetime string
+    user_note: Optional[str] = None
+    trigger_significance_check: bool = False    # always False in v1
+    schema_version: int = 1
+
+
+class Boundary3Output(BaseModel):
+    user_id: str
+    task_id: str
+    success: bool
+    error: Optional[BoundaryError] = None
+    schema_version: int = 1
+
+
+================================================================================
+FILE: core\schemas\contracts\task_coaching.py
+================================================================================
+# PATH: stride_backend/core/schemas/contracts/task_coaching.py
+# DOMAIN: Task Coach contract — task generation from timetable slots and task regeneration after edit
+
+from __future__ import annotations
+from datetime import date
+from typing import List, Optional
+from pydantic import BaseModel
+from core.schemas.entities import FeedbackEvent, Task, TaskStatus, GoalStatus
+from core.schemas.contracts.shared import BoundaryError
+
+
+# ── Type 1 — Task Generation (Mode 1) ─────────────────────────────────────────
+
+class MilestoneSlot(BaseModel):
+    milestone_id: str
+    goal_id: str
+    scheduled_date: date
+    scheduled_time_window: str
+    estimated_duration_minutes: int
+
+
+class TaskGenerationInput(BaseModel):
+    user_id: str
+    milestone_id: str
+    goal_id: str
+    milestone_description: str
+    slots: List[MilestoneSlot]
+    goal_context: str
+    previous_task_logs: List[FeedbackEvent]
+
+
+class TaskGenerationOutput(BaseModel):
+    user_id: str
+    milestone_id: str
+    tasks: List[Task]
+    error: Optional[BoundaryError] = None
+
+
+# ── Type 2 — Task Regeneration (Mode 2) ───────────────────────────────────────
+
+class TaskRegenerationInput(BaseModel):
+    user_id: str
+    task_id: str
+    goal_id: str
+    milestone_id: str
+    new_description: str
+    new_scheduled_date: date
+    new_scheduled_time_window: str
+    new_estimated_duration_minutes: int
+    reason_for_change: str
+
+
+class TaskRegenerationOutput(BaseModel):
+    user_id: str
+    task_id: str
+    regenerated_task: Task
+    error: Optional[BoundaryError] = None
+
+
+================================================================================
+FILE: core\schemas\contracts\task_decomposition.py
+================================================================================
+from typing import List, Optional
+from pydantic import BaseModel, Field
+
+from core.schemas.enums import TaskTag
+from core.schemas.contracts.shared import BoundaryError, CompletedTaskSummary
+
+
+class TaskDraft(BaseModel):
+    description: str
+    tag: TaskTag
+    dependencies: List[str] = Field(default_factory=list)
+    # dependencies reference other task descriptions
+    # API resolves these to task_ids on write
+    schema_version: int = 1
+
+
+class TaskDecompositionInput(BaseModel):
+    milestone_id: str
+    milestone_description: str
+    objectives: List[str]
+    success_metrics: List[str]
+    previous_task_logs: List[CompletedTaskSummary] = Field(default_factory=list)
+    schema_version: int = 1
+
+
+class TaskDecompositionOutput(BaseModel):
+    milestone_id: str
+    tasks: List[TaskDraft]
+    error: Optional[BoundaryError] = None
+    schema_version: int = 1
+
+
+class StalledTaskBreakdownInput(BaseModel):
+    task_id: str
+    description: str
+    tag: TaskTag
+    milestone_id: str
+    milestone_description: str
+    schema_version: int = 1
+
+
+class StalledTaskBreakdownOutput(BaseModel):
+    original_task_id: str
+    replacement_tasks: List[TaskDraft]     # 2–4 MODERATE or MECHANICAL tasks
+    error: Optional[BoundaryError] = None
+    schema_version: int = 1
+
+
+================================================================================
+FILE: core\schemas\contracts\distillation_write.py
+================================================================================
+# PATH: stride_backend/core/schemas/contracts/distillation_write.py
+# DOMAIN: Pydantic schemas for SRSH Boundary 5 — Model Agent internal distillation write.
+
+from __future__ import annotations
+from enum import Enum
+from typing import List, Optional
+from pydantic import BaseModel
+
+from core.schemas.entities import (
+    SelfEfficacyLevel,
+    BehaviouralBaseline,
+    CapacityIndicators,
+)
+from core.schemas.contracts.shared import BoundaryError, RecentFeedbackEvent
+from core.schemas.contracts.goal_structuring import DistilledModelSnapshot
+
+
+class DistillationOperation(str, Enum):
+    DISTILLED_MODEL_UPDATE = "distilled_model_update"
+    PRIORITY_LIST_REWRITE  = "priority_list_rewrite"
+    SIGNIFICANCE_CHECK     = "significance_check"
+
+
+class UpdatedDistilledModel(BaseModel):
+    self_efficacy_signal: SelfEfficacyLevel
+    behavioural_baseline: BehaviouralBaseline
+    capacity_indicators: CapacityIndicators
+    calibration_period_active: bool
+
+
+class Boundary5Input(BaseModel):
+    user_id: str
+    raw_log_window: List[RecentFeedbackEvent]
+    current_distilled_model: DistilledModelSnapshot
+    operation: DistillationOperation
+
+
+class Boundary5Output(BaseModel):
+    user_id: str
+    updated_distilled_model: UpdatedDistilledModel
+    distillation_version: int
+    operation_fired: DistillationOperation
+    write_confirmed: bool
+    error: Optional[BoundaryError] = None
+
+
+================================================================================
+FILE: orchestrators\goal_structuring.py
+================================================================================
+# PATH: stride_backend/orchestrators/goal_structuring.py
+# DOMAIN: Orchestrates the multi-agent pipeline that transforms raw user input into a structured SMART goal.
+
+"""
+Coordinates the sequential execution of the model_agent context retrieval, smart_agent SMART analysis, and scheduling component to produce a fully structured goal with tasks. Acts as the top-level controller for the Boundary 1 to 3 pipeline. Implemented in Phase 1 (Orchestration). Belongs to the Coaching Pipeline milestone.
+"""
+
+
+
+================================================================================
+FILE: evaluation\personas\blessing_nwachukwu.py
+================================================================================
+"""
+evaluation/personas/blessing_nwachukwu.py
+
+Persona 5 — Blessing Nwachukwu. 23, Enugu. Post-NYSC, job-hunting.
+High energy, anxious about peers, fast-paced. Arrives wanting to do too much.
+
+Layer B targets:
+  - Capacity conflict trigger    (Day 1: 3 goals simultaneously)
+  - Mid-week pro-rata adjustment (goals confirmed same week)
+  - Ceiling reached              (Month 2: fast output exhausts max_weekly_units)
+  - Anti-clumping                (Month 2: consecutive pulls from same milestone)
+  - Urgency multiplier           (Month 3: job interview short deadline)
+  - Tri-Vector normalization     (all multi-milestone points)
+
+CAPACITY CONFLICT MATH:
+  max_workable_hours = 20.0 (no job, no dependents, high availability)
+  conflict threshold = 20.0 × 3 = 60 min_weekly_units
+  Three goals submitted simultaneously. If each goal's milestones each
+  carry min_weekly_units ≥ 3, the combined total (3 goals × 2+ milestones
+  × 3 units) should comfortably exceed 60 — forcing the conflict.
+  The system's response to this is the key Layer B check.
+  If conflict does NOT trigger: Layer B Fail — log it.
+
+NOTE: Blessing has high capacity but the conflict threshold is proportionally
+higher too (× 3 of 20hrs = 60 units). The scripts submits all 3 goals in
+week 1 in quick succession. The third confirm_goal call is the trigger point.
+"""
+
+USER_ID = "blessing_nwachukwu"
+
+CONTEXT: dict = {}
+
+# Capacity: no job, no dependents. Full days available.
+# High max_workable_hours — but the conflict threshold scales with this,
+# so submitting 3 goals simultaneously should still trigger it.
+ONBOARDING_PAYLOAD = {
+    "user_id": USER_ID,
+    "max_workable_hours": 20.0,
+    "weekday_blocks": [
+        {
+            "label": "morning deep work",
+            "start_time": "08:00",
+            "end_time": "12:00",
+            "energy_level": "HIGH",
+        },
+        {
+            "label": "afternoon session",
+            "start_time": "14:00",
+            "end_time": "17:00",
+            "energy_level": "MEDIUM",
+        },
+    ],
+    "weekend_blocks": [
+        {
+            "label": "Saturday morning",
+            "start_time": "09:00",
+            "end_time": "12:00",
+            "energy_level": "HIGH",
+        },
+        {
+            "label": "Sunday light work",
+            "start_time": "15:00",
+            "end_time": "17:00",
+            "energy_level": "LOW",
+        },
+    ],
+}
+
+
+def _current_week_monday() -> str:
+    from datetime import date, timedelta
+    today = date.today()
+    return (today - timedelta(days=today.weekday())).isoformat()
+
+
+WEEK_1_MONDAY = _current_week_monday()
+
+
+def _week_date(n: int) -> str:
+    from datetime import date, timedelta
+    anchor = date.fromisoformat(WEEK_1_MONDAY)
+    return (anchor + timedelta(weeks=n - 1)).isoformat()
+
+
+SCRIPT = [
+    # ─────────────── MONTH 1 — 3 goals day 1, capacity conflict ─────────────
+    # Goal 1: Land a job. Urgent framing, no fixed deadline yet.
+    {
+        "week": 1,
+        "event_type": "draft_goal",
+        "path": "/goals/draft",
+        "payload": {
+            "user_id": USER_ID,
+            "raw_goal": "Land a job in tech or product management as fast as possible.",
+            "user_context": (
+                "Just finished NYSC, actively job-hunting. No income yet, "
+                "living with parents. High urgency — peers are already "
+                "employed. Has lots of free time to dedicate."
+            ),
+        },
+        "save_as": "job_draft",
+    },
+    {
+        "week": 1,
+        "event_type": "structure_goal",
+        "path": "/goals/structure",
+        "payload": {
+            "user_id": USER_ID,
+            "confirmed_draft": "{{job_draft}}",
+            "existing_goal_summaries": [],
+        },
+        "save_as": "job_structured",
+    },
+    {
+        "week": 1,
+        "event_type": "confirm_goal",
+        "path": "/goals/confirm",
+        "payload": {
+            "user_id": USER_ID,
+            "confirmed_draft": "{{job_draft}}",
+            "smart_assessment": "{{job_structured}}",
+            "week_start": WEEK_1_MONDAY,
+        },
+        "save_as": "job_confirmed",
+    },
+    # Goal 2: Learn a skill (e.g. SQL/data analytics). Also urgent framing.
+    {
+        "week": 1,
+        "event_type": "draft_goal",
+        "path": "/goals/draft",
+        "payload": {
+            "user_id": USER_ID,
+            "raw_goal": "Learn SQL and data analytics properly — I keep seeing it in job listings.",
+            "user_context": (
+                "Wants to add this skill to strengthen job applications. "
+                "Frames it as urgent. Already submitted a job-search goal "
+                "this same session."
+            ),
+        },
+        "save_as": "skill_draft",
+    },
+    {
+        "week": 1,
+        "event_type": "structure_goal",
+        "path": "/goals/structure",
+        "payload": {
+            "user_id": USER_ID,
+            "confirmed_draft": "{{skill_draft}}",
+            "existing_goal_summaries": "{{ACTIVE_GOAL_SUMMARIES}}",
+        },
+        "save_as": "skill_structured",
+    },
+    {
+        "week": 1,
+        "event_type": "confirm_goal",
+        "path": "/goals/confirm",
+        "payload": {
+            "user_id": USER_ID,
+            "confirmed_draft": "{{skill_draft}}",
+            "smart_assessment": "{{skill_structured}}",
+            "week_start": WEEK_1_MONDAY,
+        },
+        "save_as": "skill_confirmed",
+    },
+    # Goal 3: Build a portfolio project. Also framed as urgent.
+    # This third confirm_goal is the capacity conflict trigger point.
+    {
+        "week": 1,
+        "event_type": "draft_goal",
+        "path": "/goals/draft",
+        "payload": {
+            "user_id": USER_ID,
+            "raw_goal": (
+                "Build a portfolio project — a data dashboard or product "
+                "case study — that I can show in interviews."
+            ),
+            "user_context": (
+                "Wants this done ASAP to support job applications. "
+                "Already submitted job-search and SQL learning goals today."
+            ),
+        },
+        "save_as": "portfolio_draft",
+    },
+    {
+        "week": 1,
+        "event_type": "structure_goal",
+        "path": "/goals/structure",
+        "payload": {
+            "user_id": USER_ID,
+            "confirmed_draft": "{{portfolio_draft}}",
+            "existing_goal_summaries": "{{ACTIVE_GOAL_SUMMARIES}}",
+        },
+        "save_as": "portfolio_structured",
+        "notes": (
+            "Layer A Criterion 2 (Goal Viability): three concurrent urgent "
+            "goals submitted on day 1. Does structure_goal surface a "
+            "viability concern at this point, or produce another unchecked "
+            "milestone plan?"
+        ),
+    },
+    {
+        "week": 1,
+        "event_type": "confirm_goal",
+        "path": "/goals/confirm",
+        "payload": {
+            "user_id": USER_ID,
+            "confirmed_draft": "{{portfolio_draft}}",
+            "smart_assessment": "{{portfolio_structured}}",
+            "week_start": WEEK_1_MONDAY,
+        },
+        "save_as": "portfolio_confirmed",
+        "notes": (
+            "Layer B: capacity conflict trigger. This is the 3rd goal "
+            "confirm in week 1. new_total_min_weekly_units should exceed "
+            "max_workable_hours × 3 = 60 here. If the system does NOT "
+            "raise a conflict, that is a Layer B Fail. "
+            "Layer B: mid-week pro-rata — all three goals confirmed same "
+            "week, mid-week pro-rata adjustment should apply to at least "
+            "the 2nd and 3rd goals."
+        ),
+    },
+
+    # ─────────────── MONTH 2 — High output, ceiling test ────────────────────
+    # Blessing is fast-moving. Pull multiple times in a single week to
+    # exhaust max_weekly_units. Layer B: ceiling reached check.
+    # Also tests anti-clumping — 3rd consecutive pull from same milestone
+    # should be redirected.
+    {
+        "week": 1,
+        "event_type": "pull_task",
+        "path": "/tasks/pull",
+        "payload": {
+            "user_id": USER_ID,
+            "current_energy_level": "HIGH",
+            "consecutive_pull_count": 0,
+        },
+        "save_as": "pull_w1_a",
+    },
+    {
+        "week": 1,
+        "event_type": "complete_task",
+        "path": "/tasks/complete",
+        "payload": {
+            "user_id": USER_ID,
+            "task_id": "{{pull_w1_a.pulled_task.task_id}}",
+            "goal_id": "{{pull_w1_a.pulled_task.goal_id}}",
+            "milestone_id": "{{pull_w1_a.pulled_task.milestone_id}}",
+        },
+    },
+    {
+        "week": 1,
+        "event_type": "advance_week",
+        "payload": {"user_id": USER_ID, "week_start": _week_date(1)},
+    },
+    {
+        "week": 2,
+        "event_type": "pull_task",
+        "path": "/tasks/pull",
+        "payload": {
+            "user_id": USER_ID,
+            "current_energy_level": "HIGH",
+            "consecutive_pull_count": 0,
+        },
+        "save_as": "pull_w2_a",
+    },
+    {
+        "week": 2,
+        "event_type": "complete_task",
+        "path": "/tasks/complete",
+        "payload": {
+            "user_id": USER_ID,
+            "task_id": "{{pull_w2_a.pulled_task.task_id}}",
+            "goal_id": "{{pull_w2_a.pulled_task.goal_id}}",
+            "milestone_id": "{{pull_w2_a.pulled_task.milestone_id}}",
+        },
+    },
+    # Second pull same week — consecutive_pull_count=1.
+    {
+        "week": 2,
+        "event_type": "pull_task",
+        "path": "/tasks/pull",
+        "payload": {
+            "user_id": USER_ID,
+            "current_energy_level": "HIGH",
+            "consecutive_pull_count": 1,
+        },
+        "save_as": "pull_w2_b",
+    },
+    {
+        "week": 2,
+        "event_type": "complete_task",
+        "path": "/tasks/complete",
+        "payload": {
+            "user_id": USER_ID,
+            "task_id": "{{pull_w2_b.pulled_task.task_id}}",
+            "goal_id": "{{pull_w2_b.pulled_task.goal_id}}",
+            "milestone_id": "{{pull_w2_b.pulled_task.milestone_id}}",
+        },
+    },
+    # Third pull same week — if pull_w2_a and pull_w2_b were from the same
+    # milestone, this should trigger anti-clumping and redirect elsewhere.
+    # Layer B: anti-clumping check.
+    {
+        "week": 2,
+        "event_type": "pull_task",
+        "path": "/tasks/pull",
+        "payload": {
+            "user_id": USER_ID,
+            "current_energy_level": "HIGH",
+            "consecutive_pull_count": 2,
+        },
+        "save_as": "pull_w2_c",
+        "notes": (
+            "Layer B: anti-clumping check. If pull_w2_a and pull_w2_b "
+            "were from the same MODERATE/MECHANICAL milestone, this pull "
+            "should exclude that milestone and serve from elsewhere. "
+            "Verify milestone_id on pull_w2_c differs from pull_w2_a/b."
+        ),
+    },
+    {
+        "week": 2,
+        "event_type": "complete_task",
+        "path": "/tasks/complete",
+        "payload": {
+            "user_id": USER_ID,
+            "task_id": "{{pull_w2_c.pulled_task.task_id}}",
+            "goal_id": "{{pull_w2_c.pulled_task.goal_id}}",
+            "milestone_id": "{{pull_w2_c.pulled_task.milestone_id}}",
+        },
+    },
+    # Fourth pull — ceiling test. If all milestones have hit max_weekly_units,
+    # this should return ALL_CEILINGS_REACHED.
+    {
+        "week": 2,
+        "event_type": "pull_task",
+        "path": "/tasks/pull",
+        "payload": {
+            "user_id": USER_ID,
+            "current_energy_level": "MEDIUM",
+            "consecutive_pull_count": 3,
+        },
+        "save_as": "pull_w2_ceiling",
+        "notes": (
+            "Layer B: ceiling reached check. After 3 completions in week 2, "
+            "active milestones may have hit max_weekly_units. If this pull "
+            "returns ALL_CEILINGS_REACHED, that is a Pass. If it returns "
+            "another task without having met ceiling, verify whether "
+            "max_weekly_units was actually exhausted — may not be a Fail "
+            "if capacity genuinely remains."
+        ),
+    },
+    {
+        "week": 2,
+        "event_type": "advance_week",
+        "payload": {"user_id": USER_ID, "week_start": _week_date(2)},
+    },
+    {
+        "week": 4,
+        "event_type": "advance_week",
+        "payload": {"user_id": USER_ID, "week_start": _week_date(5)},
+    },
+
+    # ─────────────── MONTH 3 — Interview, urgency spike ──────────────────────
+    # First-round job interview — short deadline, urgency spike.
+    # Layer B: urgency multiplier on job goal (7–30d bracket, U=1.5).
+    {
+        "week": 9,
+        "event_type": "edit_goal_deadline",
+        "method": "PATCH",
+        "path": "/goals/{{job_confirmed.goal_id}}",
+        "payload": {
+            "user_id": USER_ID,
+            "terminal_deadline": _week_date(11),  # ~2 weeks from week 9
+        },
+        "save_as": "job_urgency_update",
+        "notes": (
+            "First-round interview in 2 weeks. Layer B: urgency multiplier "
+            "— deadline shifts into 7–30d bracket (U=1.5). Tri-Vector "
+            "weights should shift sharply toward job goal. "
+            "Layer A Criterion 3: does guidance communicate explicitly what "
+            "this means for skill and portfolio goals this week?"
+        ),
+    },
+    {
+        "week": 9,
+        "event_type": "pull_task",
+        "path": "/tasks/pull",
+        "payload": {
+            "user_id": USER_ID,
+            "current_energy_level": "HIGH",
+            "consecutive_pull_count": 0,
+        },
+        "save_as": "pull_w9_a",
+    },
+    {
+        "week": 9,
+        "event_type": "complete_task",
+        "path": "/tasks/complete",
+        "payload": {
+            "user_id": USER_ID,
+            "task_id": "{{pull_w9_a.pulled_task.task_id}}",
+            "goal_id": "{{pull_w9_a.pulled_task.goal_id}}",
+            "milestone_id": "{{pull_w9_a.pulled_task.milestone_id}}",
+        },
+    },
+    {
+        "week": 9,
+        "event_type": "advance_week",
+        "payload": {"user_id": USER_ID, "week_start": _week_date(9)},
+    },
+    {
+        "week": 11,
+        "event_type": "advance_week",
+        "payload": {"user_id": USER_ID, "week_start": _week_date(13)},
+    },
+
+    # ─────────────── MONTH 4 — Interview didn't convert ──────────────────────
+    # Disappointment. Blessing is frustrated. She doesn't submit anything
+    # new — just a pull, which reflects someone showing up but deflated.
+    # Layer A Criterion 1: does guidance acknowledge the emotional context
+    # of a missed opportunity, or barrel through with task allocation?
+    # TODO: Tuni — decide whether the job goal stays ACTIVE or gets paused
+    # here. Pausing it triggers weight recompute (Layer B). Keeping it
+    # active is more realistic for someone who hasn't given up.
+    # Recommendation: keep ACTIVE, reduce urgency via deadline extension
+    # (simulates her accepting she needs a longer horizon).
+    {
+        "week": 13,
+        "event_type": "pull_task",
+        "path": "/tasks/pull",
+        "payload": {
+            "user_id": USER_ID,
+            "current_energy_level": "LOW",
+            "consecutive_pull_count": 0,
+        },
+        "save_as": "pull_w13_a",
+        "notes": (
+            "Post-rejection check-in. Low energy reflects disappointment. "
+            "Layer A Criterion 1: does the guidance tone reflect her "
+            "situation, or is it obliviously upbeat?"
+        ),
+    },
+    {
+        "week": 13,
+        "event_type": "advance_week",
+        "payload": {"user_id": USER_ID, "week_start": _week_date(14)},
+    },
+
+    # ─────────────── MONTH 5 — Recalibrates, doubles down on portfolio ───────
+    # Voluntarily pauses skill goal, focuses on portfolio.
+    # Layer B: weight recompute on goal exit (skill goal paused).
+    {
+        "week": 17,
+        "event_type": "pull_task",
+        "path": "/tasks/pull",
+        "payload": {
+            "user_id": USER_ID,
+            "current_energy_level": "HIGH",
+            "consecutive_pull_count": 0,
+        },
+        "save_as": "pull_w17_a",
+    },
+    {
+        "week": 17,
+        "event_type": "complete_task",
+        "path": "/tasks/complete",
+        "payload": {
+            "user_id": USER_ID,
+            "task_id": "{{pull_w17_a.pulled_task.task_id}}",
+            "goal_id": "{{pull_w17_a.pulled_task.goal_id}}",
+            "milestone_id": "{{pull_w17_a.pulled_task.milestone_id}}",
+        },
+    },
+    {
+        "week": 17,
+        "event_type": "advance_week",
+        "payload": {"user_id": USER_ID, "week_start": _week_date(17)},
+    },
+    {
+        "week": 18,
+        "event_type": "pull_task",
+        "path": "/tasks/pull",
+        "payload": {
+            "user_id": USER_ID,
+            "current_energy_level": "HIGH",
+            "consecutive_pull_count": 0,
+        },
+        "save_as": "pull_w18_a",
+    },
+    {
+        "week": 18,
+        "event_type": "complete_task",
+        "path": "/tasks/complete",
+        "payload": {
+            "user_id": USER_ID,
+            "task_id": "{{pull_w18_a.pulled_task.task_id}}",
+            "goal_id": "{{pull_w18_a.pulled_task.goal_id}}",
+            "milestone_id": "{{pull_w18_a.pulled_task.milestone_id}}",
+        },
+    },
+    {
+        "week": 18,
+        "event_type": "advance_week",
+        "payload": {"user_id": USER_ID, "week_start": _week_date(19)},
+    },
+
+    # ─────────────── MONTH 6 — Job lands, portfolio concludes ────────────────
+    # TODO: Toni — pick whether job offer arrives in week 21 or 22.
+    # Portfolio goal either completes (natural close) or is superseded.
+    # Onboarding-to-new-role goal not scripted here — add it post-decision.
+    {
+        "week": 21,
+        "event_type": "pull_task",
+        "path": "/tasks/pull",
+        "payload": {
+            "user_id": USER_ID,
+            "current_energy_level": "HIGH",
+            "consecutive_pull_count": 0,
+        },
+        "save_as": "pull_w21_a",
+    },
+    {
+        "week": 21,
+        "event_type": "complete_task",
+        "path": "/tasks/complete",
+        "payload": {
+            "user_id": USER_ID,
+            "task_id": "{{pull_w21_a.pulled_task.task_id}}",
+            "goal_id": "{{pull_w21_a.pulled_task.goal_id}}",
+            "milestone_id": "{{pull_w21_a.pulled_task.milestone_id}}",
+        },
+    },
+    {
+        "week": 21,
+        "event_type": "advance_week",
+        "payload": {"user_id": USER_ID, "week_start": _week_date(21)},
+    },
+    {
+        "week": 23,
+        "event_type": "advance_week",
+        "payload": {"user_id": USER_ID, "week_start": _week_date(23)},
+    },
+]
+
+
+================================================================================
+FILE: evaluation\runner.py
+================================================================================
+"""
+evaluation/runner.py
+
+Drives a persona's scripted trajectory against the real Stride API.
+Logs every request/response. Halts the entire process on the first
+non-2xx response or failed Layer B check. No retries, no continuing.
+
+Usage:
+    python runner.py amaka_eze
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+
+BASE_URL = "http://localhost:8000"  # adjust if Stride runs elsewhere
+
+
+def halt(reason: str, context: dict):
+    print(f"\n{'='*60}\nHALTED: {reason}\n{'='*60}")
+    print(json.dumps(context, indent=2, default=str))
+    sys.exit(1)
+
+
+def _resolve(value, context: dict):
+    """
+    Recursively resolve {{key}} or {{key.nested.path}} placeholders.
+    Handles both a string that IS entirely a placeholder (returns the
+    resolved value with its original type, e.g. a dict or int) and a
+    placeholder embedded inside a larger string like a URL path (returns
+    a string with the substitution applied, stringified).
+    """
+    if isinstance(value, str) and "{{" in value and "}}" in value:
+        # Whole-string placeholder — preserve the resolved value's real type
+        if value.startswith("{{") and value.endswith("}}") and value.count("{{") == 1:
+            path = value[2:-2].strip()
+            return _lookup(path, context)
+
+        # Embedded placeholder(s) inside a larger string (e.g. URL path) —
+        # substitute in place, result is always a string
+        import re
+        def _sub(match):
+            return str(_lookup(match.group(1).strip(), context))
+        return re.sub(r"\{\{([^}]+)\}\}", _sub, value)
+
+    if isinstance(value, dict):
+        return {k: _resolve(v, context) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_resolve(v, context) for v in value]
+    return value
+
+
+def _lookup(path: str, context: dict):
+    parts = path.split(".")
+    current = context
+    for part in parts:
+        if isinstance(current, dict):
+            if part not in current:
+                halt(
+                    f"Placeholder {{{{{path}}}}} could not be resolved — "
+                    f"key '{part}' not found in saved context.",
+                    {"available_keys": list(current.keys())},
+                )
+            current = current[part]
+        else:
+            halt(
+                f"Placeholder {{{{{path}}}}} could not be resolved — "
+                f"tried to index into a non-dict at '{part}'.",
+                {"current_value": current},
+            )
+    return current
+
+
+def call(method: str, path: str, log_file, expect_status: int = 200, timeout: int = 30, **kwargs):
+    """Make one API call, log it, halt if status doesn't match.
+
+    timeout default is 30s for normal calls. confirm_goal runs TaskDecomposer
+    once per milestone (sequential LLM calls) plus SchedulingComponent —
+    callers should pass a higher timeout (e.g. 120) for that endpoint.
+    """
+    url = f"{BASE_URL}{path}"
+    response = requests.request(method, url, timeout=timeout, **kwargs)
+
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "method": method,
+        "path": path,
+        "request_body": kwargs.get("json"),
+        "status_code": response.status_code,
+        "response_body": _safe_json(response),
+    }
+    log_file.write(json.dumps(entry, default=str) + "\n")
+    log_file.flush()
+
+    if response.status_code != expect_status:
+        halt(
+            f"{method} {path} returned {response.status_code}, expected {expect_status}",
+            entry,
+        )
+
+    return _safe_json(response)
+
+
+def _safe_json(response):
+    try:
+        return response.json()
+    except ValueError:
+        return {"raw_text": response.text}
+
+
+def run_persona(persona_module_name: str):
+    persona = __import__(f"personas.{persona_module_name}", fromlist=["SCRIPT", "ONBOARDING_PAYLOAD", "USER_ID"])
+
+    log_dir = Path(f"logs/{persona.USER_ID}")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "events.jsonl"
+
+    with open(log_path, "w") as log_file:
+        print(f"--- Onboarding {persona.USER_ID} ---")
+        call("POST", "/onboarding/profile", log_file, json=persona.ONBOARDING_PAYLOAD)
+
+        for i, step in enumerate(persona.SCRIPT):
+            print(f"[{i+1}/{len(persona.SCRIPT)}] {step['event_type']} (week {step['week']})")
+
+            if step["event_type"] == "advance_week":
+                call("POST", "/weekly/cycle", log_file, json=step["payload"])
+                continue
+
+            method = step.get("method", "POST")
+            path = _resolve(step["path"], persona.CONTEXT)
+            expect_status = step.get("expect_status", 200)
+            # confirm_goal runs TaskDecomposer once per milestone, sequentially,
+            # each a real LLM call with its own retry loop (AGENT_MAX_RETRIES=3
+            # per call per .env). On a free-tier Gemini key with rate limiting,
+            # 4 milestones x retries can genuinely take several minutes — this
+            # is not a bug, it's the real cost of the operation. 300s gives
+            # real headroom rather than guessing again.
+            default_timeout = 300 if step["event_type"] == "confirm_goal" else 30
+            timeout = step.get("timeout", default_timeout)
+
+            # ACTIVE_GOAL_SUMMARIES isn't a saved prior response, and there
+            # is no GET /goals list endpoint (confirmed absent from
+            # api/routes/goals.py) — so the harness reconstructs it locally.
+            # GoalSummary requires goal_id, name, macro_impact,
+            # terminal_deadline, status (core/schemas/contracts/shared.py) —
+            # confirm_goal's response only returns goal_id, so the rest is
+            # pulled from the smart_assessment that was sent INTO that same
+            # confirm_goal call (mirrors how the route itself builds the
+            # Goal object internally). Built incrementally in
+            # persona.CONTEXT["_goal_summaries"] every time a confirm_goal
+            # step runs, not reconstructed from scratch here.
+            if "ACTIVE_GOAL_SUMMARIES" in json.dumps(step["payload"]):
+                persona.CONTEXT["ACTIVE_GOAL_SUMMARIES"] = list(
+                    persona.CONTEXT.get("_goal_summaries", {}).values()
+                )
+
+            resolved_payload = _resolve(step["payload"], persona.CONTEXT)
+
+            # Fix for confirmed timing bug: complete_task steps never sent
+            # completion_timestamp, so the backend defaulted to real
+            # wall-clock time (datetime.now()) instead of the simulated
+            # week the script is pretending to be in. Once /weekly/cycle
+            # advances week_start months into the simulated future, real-
+            # "now" timestamps never fall inside that window again, so
+            # every completion after week 1 was invisible to
+            # compute_consumed_units — tasks_completed read 0 every cycle
+            # regardless of real activity. Auto-inject a timestamp derived
+            # from the step's own "week" field (every step already has
+            # one) using the persona's existing _week_date() helper, so
+            # this is fixed once here rather than requiring every
+            # complete_task entry in every persona script to set it by hand.
+            if (
+                step["event_type"] == "complete_task"
+                and "completion_timestamp" not in resolved_payload
+            ):
+                week_date_fn = getattr(persona, "_week_date", None)
+                if week_date_fn is not None:
+                    sim_date = week_date_fn(step["week"])
+                    # Land it midweek, midday, so it's safely inside
+                    # [week_start, week_start+7) regardless of which day
+                    # of the simulated week the step represents.
+                    resolved_payload["completion_timestamp"] = (
+                        f"{sim_date}T12:00:00+00:00"
+                    )
+                else:
+                    halt(
+                        f"complete_task step at week {step['week']} has no "
+                        f"completion_timestamp and persona module "
+                        f"'{persona_module_name}' has no _week_date() helper "
+                        f"to derive one from — cannot safely default to "
+                        f"real wall-clock time, that's the exact bug this "
+                        f"fix exists to prevent.",
+                        {"step": step},
+                    )
+
+            result = call(method, path, log_file, expect_status=expect_status, timeout=timeout, json=resolved_payload)
+
+            if "save_as" in step:
+                persona.CONTEXT[step["save_as"]] = result
+
+            # After a successful confirm_goal, build the GoalSummary this
+            # goal will need for future ACTIVE_GOAL_SUMMARIES lookups,
+            # using the same smart_assessment data the route itself used
+            # to build the Goal object — not invented separately.
+            if step["event_type"] == "confirm_goal" and "goal_id" in result:
+                smart = resolved_payload.get("smart_assessment", {})
+                deadline = smart.get("extracted_deadline")
+                if deadline is None:
+                    # GoalSummary.terminal_deadline is a required str, not
+                    # Optional — but not every goal has a real deadline
+                    # (e.g. open-ended habits). Use a far-future placeholder
+                    # rather than crash; this only affects the harness's
+                    # local existing_goal_summaries reconstruction, not any
+                    # real backend state.
+                    deadline = "2099-12-31"
+                summary = {
+                    "goal_id": result["goal_id"],
+                    "name": smart.get("smart_formulation", {}).get("specific", "Unnamed Goal"),
+                    "macro_impact": smart.get("impact_score", 3),
+                    "terminal_deadline": deadline,
+                    "status": "ACTIVE",
+                }
+                persona.CONTEXT.setdefault("_goal_summaries", {})[result["goal_id"]] = summary
+
+    print(f"\nDone. {len(persona.SCRIPT)} steps completed. Log: {log_path}")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python runner.py <persona_module_name>")
+        sys.exit(1)
+    run_persona(sys.argv[1])
+
+
+================================================================================
+GREP: capacity|conflict (case-insensitive) across repo
+================================================================================
+C:\Users\user\stride_backend\agents\drafting_agent\prompts.py:35: - You do not assess viability, capacity, or scheduling. That is not your job.
+C:\Users\user\stride_backend\agents\model_agent\agent.py:5: Implements the LangChain agent that analyses accumulated raw store data to construct and update a structured model of user behaviour, capacity, and goal patterns. Delegates execution steps to executor.py and uses prompts from prompts.py. Implemented in Phase 3 (User Modelling). Belongs to the Adaptive Coaching milestone.
+C:\Users\user\stride_backend\agents\model_agent\executor.py:221: priority_conflict_flagged=False,
+C:\Users\user\stride_backend\agents\model_agent\executor.py:248: priority_conflict_flagged=False,
+C:\Users\user\stride_backend\agents\model_agent\executor.py:254: if output.override_flag and output.priority_conflict_flagged:
+C:\Users\user\stride_backend\agents\model_agent\executor.py:260: reason="User override on timetable edit with priority conflict.",
+C:\Users\user\stride_backend\agents\model_agent\prompts.py:23: - Be honest. Flag when a proposed edit exceeds demonstrated capacity.
+C:\Users\user\stride_backend\agents\model_agent\prompts.py:52: priority_conflict_flagged: bool = False
+C:\Users\user\stride_backend\agents\model_agent\prompts.py:164: 1. Check whether the edit respects the user's capacity limits.
+C:\Users\user\stride_backend\agents\model_agent\prompts.py:166: If so, set priority_conflict_flagged=true.
+C:\Users\user\stride_backend\agents\model_agent\prompts.py:167: 3. If within capacity and priority-consistent � accept. Set edit_accepted=true.
+C:\Users\user\stride_backend\agents\model_agent\prompts.py:177: "priority_conflict_flagged": bool,
+C:\Users\user\stride_backend\agents\scheduling\component.py:5: Implements the scheduling logic that takes a validated SMART goal and produces an ordered list of tasks with due dates, effort estimates, and dependencies. Reads user capacity from the distilled store to calibrate the schedule. Implemented in Phase 2 (Scheduling). Belongs to the Coaching Pipeline milestone.
+C:\Users\user\stride_backend\agents\smart_agent\agent.py:53: conflict_flag=False,
+C:\Users\user\stride_backend\agents\smart_agent\agent.py:115: conflict_flag=output.conflict_flag,
+C:\Users\user\stride_backend\agents\smart_agent\agent.py:170: conflict_flag=False,
+C:\Users\user\stride_backend\agents\smart_agent\prompts.py:18: 2. Assess its viability against the user's context and capacity
+C:\Users\user\stride_backend\agents\smart_agent\prompts.py:48: conflict_flag: bool = False
+C:\Users\user\stride_backend\agents\smart_agent\prompts.py:103: is achievable given the user's context, existing goals, and stated capacity.
+C:\Users\user\stride_backend\agents\smart_agent\prompts.py:106: 5. Set conflict_flag to true if this goal would create a serious overlap or
+C:\Users\user\stride_backend\agents\smart_agent\prompts.py:119: "conflict_flag": bool
+C:\Users\user\stride_backend\api\routes\goals.py:278: # -- Capacity conflict check ------------------------------------------------
+C:\Users\user\stride_backend\core\schemas\contracts\distillation_write.py:12: CapacityIndicators,
+C:\Users\user\stride_backend\core\schemas\contracts\distillation_write.py:27: capacity_indicators: CapacityIndicators
+C:\Users\user\stride_backend\core\schemas\contracts\goal_scheduling.py:9: from core.schemas.entities import SmartFormulation, CapacityIndicators, PriorityEntry
+C:\Users\user\stride_backend\core\schemas\contracts\goal_scheduling.py:37: capacity_indicators: CapacityIndicators
+C:\Users\user\stride_backend\core\schemas\contracts\goal_scheduling.py:46: conflicts_resolved: List[str]
+C:\Users\user\stride_backend\core\schemas\contracts\goal_structuring.py:32: conflict_flag: bool = False
+C:\Users\user\stride_backend\core\schemas\enums.py:19: STAGED = "STAGED"           # approved, waiting for capacity or epoch boundary
+C:\Users\user\stride_backend\evaluation\evaluation\personas\amaka_eze.py:6: skeptical but curious. Low-to-moderate weekly capacity (full-time job +
+C:\Users\user\stride_backend\evaluation\evaluation\personas\amaka_eze.py:17: # Capacity: works full-time, studies part-time. Evenings + weekends only.
+C:\Users\user\stride_backend\evaluation\personas\amaka_eze.py:6: skeptical but curious. Low-to-moderate weekly capacity (full-time job +
+C:\Users\user\stride_backend\evaluation\personas\amaka_eze.py:17: # Capacity: works full-time, studies part-time. Evenings + weekends only.
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:8: - Capacity conflict trigger    (Day 1: 3 goals simultaneously)
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:15: CAPACITY CONFLICT MATH:
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:17: conflict threshold = 20.0 � 3 = 60 min_weekly_units
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:20: � 3 units) should comfortably exceed 60 � forcing the conflict.
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:22: If conflict does NOT trigger: Layer B Fail � log it.
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:24: NOTE: Blessing has high capacity but the conflict threshold is proportionally
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:33: # Capacity: no job, no dependents. Full days available.
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:34: # High max_workable_hours � but the conflict threshold scales with this,
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:86: # --------------- MONTH 1 � 3 goals day 1, capacity conflict -------------
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:166: # This third confirm_goal is the capacity conflict trigger point.
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:213: "Layer B: capacity conflict trigger. This is the 3rd goal "
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:216: "raise a conflict, that is a Layer B Fail. "
+C:\Users\user\stride_backend\evaluation\personas\blessing_nwachukwu.py:349: "if capacity genuinely remains."
+C:\Users\user\stride_backend\evaluation\personas\chiamaka_okafor.py:16: represent variable availability. Declared capacity here reflects a
+C:\Users\user\stride_backend\evaluation\personas\chiamaka_okafor.py:20: capacity model limitation, which should be acknowledged in the thesis
+C:\Users\user\stride_backend\evaluation\personas\chiamaka_okafor.py:28: # Capacity: new mother, sleep-deprived. One short window during baby's
+C:\Users\user\stride_backend\evaluation\personas\chiamaka_okafor.py:341: "health goal active. Same limited capacity throughout."
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:21: # Capacity: moderate-to-high. Regular schedule. Early mornings before
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:141: "Does structure_goal reason about how they share capacity, or "
+C:\Users\user\stride_backend\evaluation\personas\daniel_whitfield.py:407: # Work initiative conflicts with certification study during a demanding
+C:\Users\user\stride_backend\evaluation\personas\ibrahim_suleiman.py:27: # Capacity: non-market-day mornings only. Market days and travel weeks
+C:\Users\user\stride_backend\evaluation\personas\margaret_sully.py:27: # Capacity: retired, low hours by choice. Morning sessions only.
+C:\Users\user\stride_backend\evaluation\personas\margaret_sully.py:241: # Floor-deficit will be common given low capacity.
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:10: - Capacity conflict trigger    (Month 3: school exam + consulting compete)
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:21: # Capacity: long commute eats mornings. Early evenings taken by family.
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:24: # Deliberately low max_workable_hours � this is what makes the capacity
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:25: # conflict meaningful when the school goal lands in Month 3.
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:199: # --------------- MONTH 3 � School exam goal, capacity conflict -----------
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:203: # Layer B: capacity conflict trigger + urgency multiplier bracket check.
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:204: # Layer A: does guidance communicate the conflict to Tunde honestly, or
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:237: "about adding a 5-week urgent goal on top of an already-capacity-"
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:253: "Layer B: capacity conflict check. new_total_min_weekly_units "
+C:\Users\user\stride_backend\evaluation\personas\tunde_bakare.py:255: "does NOT raise a conflict, that's a Layer B Fail."
+C:\Users\user\stride_backend\tests\test_goal_routes.py:55: conflict_flag=False,

@@ -1,0 +1,353 @@
+===== agents/smart_agent/prompts.py =====
+# PATH: stride_backend/agents/smart_agent/prompts.py
+# DOMAIN: Prompt templates and internal output schemas for the SMART Agent
+
+from __future__ import annotations
+
+from typing import Optional
+
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel
+
+
+# ── System prompt ──────────────────────────────────────────────────────────────
+
+SMART_AGENT_SYSTEM_PROMPT = """You are the SMART Agent in Stride, an AI-powered goal coaching system.
+
+Your role is to receive a confirmed goal draft from the Drafting Agent and:
+1. Structure it into a precise SMART formulation
+2. Assess its viability against the user's context and capacity
+3. Assign an Impact Score (1-5) representing how critical this goal is
+4. Extract the deadline from the user's intent
+
+You always return structured JSON. Never return free text.
+
+Principles:
+- You annotate the draft. You do not rewrite or regenerate it.
+- Impact Score reflects the goal's importance to the user's life or work:
+    1 = hobby / nice-to-have
+    3 = core growth / standard professional development
+    5 = critical path / high-stakes (exams, career, health)
+- Extract the deadline explicitly stated or implied by the user.
+  If no deadline is mentioned, set extracted_deadline to null.
+- Be honest about viability. Do not rubber-stamp unrealistic goals.
+- If the user overrides your assessment, record it and proceed.
+- You handle new goal structuring only. You do not edit active goals."""
+
+
+# ── Internal output schemas ────────────────────────────────────────────────────
+
+class GoalStructuringOutput(BaseModel):
+    specific: str
+    measurable: str
+    achievable: str
+    relevant: str
+    time_bound: str
+    impact_score: int               # 1–5
+    extracted_deadline: Optional[str] = None   # ISO date string e.g. "2025-12-01"
+    viability_assessment: str       # single paragraph — honest assessment
+    conflict_flag: bool = False
+
+
+class GoalCreationNegotiationOutput(BaseModel):
+    specific: str
+    measurable: str
+    achievable: str
+    relevant: str
+    time_bound: str
+    impact_score: int
+    extracted_deadline: Optional[str] = None
+    viability_assessment: str
+    override_flag: bool = False
+    override_reason: Optional[str] = None
+
+
+# ── Prompt templates ───────────────────────────────────────────────────────────
+
+GOAL_STRUCTURING_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", SMART_AGENT_SYSTEM_PROMPT),
+    ("human", """A user has confirmed a goal draft. Structure it into a SMART formulation and assess viability.
+
+CONFIRMED DRAFT:
+Objectives: {objectives}
+Proposed Milestones: {proposed_milestones}
+Success Metrics: {success_metrics}
+
+USER CONTEXT:
+{user_context}
+
+TODAY'S DATE: {today}
+
+EXISTING GOALS:
+{existing_goal_summaries}
+
+DISTILLED MODEL SNAPSHOT:
+{distilled_model_snapshot}
+
+INSTRUCTIONS:
+1. Write a SMART formulation for this goal — specific, measurable, achievable,
+   relevant, time_bound. Each field must be concrete and actionable.
+
+2. Assign an impact_score from 1 to 5:
+   - 1: hobby or optional activity
+   - 2: low-stakes personal development
+   - 3: standard professional or academic goal
+   - 4: important career or life milestone
+   - 5: critical path — failure has serious consequences (exams, health, livelihood)
+
+3. Extract extracted_deadline from the draft or user context.
+   If the user states a relative deadline (e.g. "in 10 weeks", "by next
+   month"), calculate the exact ISO date by adding that duration to
+   today's date above. Use ISO format: "YYYY-MM-DD". Set null only if no
+   deadline — relative or absolute — is stated or implied anywhere.
+4. Write viability_assessment — one honest paragraph assessing whether this goal
+   is achievable given the user's context, existing goals, and stated capacity.
+   Reference specific constraints if relevant.
+
+5. Set conflict_flag to true if this goal would create a serious overlap or
+   contradiction with an existing active goal. Otherwise false.
+
+Return JSON matching this schema exactly:
+{{
+  "specific": string,
+  "measurable": string,
+  "achievable": string,
+  "relevant": string,
+  "time_bound": string,
+  "impact_score": integer (1-5),
+  "extracted_deadline": string (ISO date) or null,
+  "viability_assessment": string,
+  "conflict_flag": bool
+}}"""),
+])
+
+
+GOAL_CREATION_NEGOTIATION_PROMPT = ChatPromptTemplate.from_messages([
+    ("system", SMART_AGENT_SYSTEM_PROMPT),
+    ("human", """A user is negotiating the structuring of a goal after receiving your initial assessment.
+
+CONFIRMED DRAFT:
+Objectives: {objectives}
+Proposed Milestones: {proposed_milestones}
+Success Metrics: {success_metrics}
+
+PREVIOUS ASSESSMENT:
+{previous_assessment}
+
+USER RESPONSE:
+{user_response}
+
+USER CONTEXT:
+{user_context}USER CONTEXT:
+{user_context}
+
+TODAY'S DATE: {today}
+
+
+INSTRUCTIONS:
+1. Read previous_assessment and user_response together.
+
+2. If the user provides new information that changes the picture
+   (more time available, prior experience, adjusted scope) —
+   update the SMART formulation and viability_assessment accordingly.
+   Set override_flag to false.
+
+3. If the user is simply overriding your assessment with no new information —
+   set override_flag to true, populate override_reason with their rationale,
+   and proceed with their preferred formulation. Never refuse an override.
+4. If the user states a relative deadline (e.g. "in 6 weeks"), calculate
+   the exact ISO date using today's date above.
+
+5. Always return a complete updated SMART formulation and impact_score.
+   Never return partial output.
+Return JSON matching this schema exactly:
+{{
+  "specific": string,
+  "measurable": string,
+  "achievable": string,
+  "relevant": string,
+  "time_bound": string,
+  "impact_score": integer (1-5),
+  "extracted_deadline": string (ISO date) or null,
+  "viability_assessment": string,
+  "override_flag": bool,
+  "override_reason": string or null
+}}"""),
+])
+===== agents/smart_agent/agent.py =====
+# PATH: stride_backend/agents/smart_agent/agent.py
+# DOMAIN: SMART Agent — goal structuring and negotiation.
+# Job ends when goal formulation is confirmed by user.
+
+from __future__ import annotations
+
+from datetime import date
+
+from langchain_openai import ChatOpenAI
+
+from agents.smart_agent.prompts import (
+    GOAL_CREATION_NEGOTIATION_PROMPT,
+    GOAL_STRUCTURING_PROMPT,
+    GoalCreationNegotiationOutput,
+    GoalStructuringOutput,
+)
+from core.schemas.contracts.goal_structuring import (
+    Boundary1Input,
+    Boundary1Output,
+    SmartFormulation,
+)
+from core.schemas.contracts.shared import BoundaryError
+
+
+async def _invoke_with_retries(chain, inputs: dict, retries: int = 3):
+    """Invoke a LangChain chain with up to `retries` attempts.
+    Raises the last exception if all attempts fail."""
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return await chain.ainvoke(inputs)
+        except Exception as e:
+            last_exc = e
+    raise last_exc
+
+
+def _error_output(
+    user_id: str, message: str, attempt_count: int = 3
+) -> Boundary1Output:
+    """Build a typed failure output. Never raises — always returns a valid Boundary1Output."""
+    return Boundary1Output(
+        user_id=user_id,
+        smart_formulation=SmartFormulation(
+            specific="",
+            measurable="",
+            achievable="",
+            relevant="",
+            time_bound="",
+        ),
+        impact_score=1,
+        extracted_deadline=None,
+        viability_assessment="SmartAgent failed to produce a formulation.",
+        conflict_flag=False,
+        override_flag=False,
+        override_reason=None,
+        error=BoundaryError(
+            code="PARSE_FAILURE",
+            message=message,
+            component="SmartAgent",
+            retry_count=attempt_count,
+        ),
+        schema_version=2,
+    )
+
+
+class SmartAgent:
+
+    def __init__(self, llm: ChatOpenAI) -> None:
+        self._llm = llm
+
+    async def structure_goal(self, input: Boundary1Input) -> Boundary1Output:
+        """
+        Receive a confirmed draft from DraftingAgent.
+        Return a SMART formulation with impact_score and extracted_deadline.
+        Does not write to storage.
+        """
+        draft = input.confirmed_draft
+        chain = GOAL_STRUCTURING_PROMPT | self._llm.with_structured_output(
+            GoalStructuringOutput
+        )
+
+        try:
+            output: GoalStructuringOutput = await _invoke_with_retries(
+                chain,
+                {
+                    "objectives": draft.get("objectives", []),
+                    "proposed_milestones": draft.get("proposed_milestones", []),
+                    "success_metrics": draft.get("success_metrics", []),
+                    "user_context": draft.get("user_context", ""),
+                    "today": date.today().isoformat(),
+                    "existing_goal_summaries": [
+                        g.model_dump() for g in input.existing_goal_summaries
+                    ],
+                    "distilled_model_snapshot": input.distilled_model_snapshot,
+                },
+            )
+        except Exception as e:
+            return _error_output(
+                user_id=input.user_id,
+                message=f"SmartAgent.structure_goal failed after 3 retries: {e}",
+            )
+
+        return Boundary1Output(
+            user_id=input.user_id,
+            smart_formulation=SmartFormulation(
+                specific=output.specific,
+                measurable=output.measurable,
+                achievable=output.achievable,
+                relevant=output.relevant,
+                time_bound=output.time_bound,
+            ),
+            impact_score=output.impact_score,
+            extracted_deadline=output.extracted_deadline,
+            viability_assessment=output.viability_assessment,
+            conflict_flag=output.conflict_flag,
+            override_flag=False,
+            override_reason=None,
+            error=None,
+            schema_version=2,
+        )
+
+    async def negotiate_goal_creation(
+        self,
+        input: Boundary1Input,
+        previous_assessment: dict,
+        user_response: str,
+    ) -> Boundary1Output:
+        """
+        Receive user pushback on a prior SMART assessment.
+        Return a revised formulation, or record an override if the user
+        provides no new information.
+        Does not write to storage.
+        """
+        draft = input.confirmed_draft
+        chain = GOAL_CREATION_NEGOTIATION_PROMPT | self._llm.with_structured_output(
+            GoalCreationNegotiationOutput
+        )
+
+        try:
+            output: GoalCreationNegotiationOutput = await _invoke_with_retries(
+                chain,
+                {
+                    "objectives": draft.get("objectives", []),
+                    "proposed_milestones": draft.get("proposed_milestones", []),
+                    "success_metrics": draft.get("success_metrics", []),
+                    "previous_assessment": previous_assessment,
+                    "user_response": user_response,
+                    "user_context": draft.get("user_context", ""),
+                    "today": date.today().isoformat(),
+                },
+            )
+        except Exception as e:
+            return _error_output(
+                user_id=input.user_id,
+                message=f"SmartAgent.negotiate_goal_creation failed after 3 retries: {e}",
+            )
+
+        return Boundary1Output(
+            user_id=input.user_id,
+            smart_formulation=SmartFormulation(
+                specific=output.specific,
+                measurable=output.measurable,
+                achievable=output.achievable,
+                relevant=output.relevant,
+                time_bound=output.time_bound,
+            ),
+            impact_score=output.impact_score,
+            extracted_deadline=output.extracted_deadline,
+            viability_assessment=output.viability_assessment,
+            conflict_flag=False,
+            override_flag=output.override_flag,
+            override_reason=output.override_reason,
+            error=None,
+            schema_version=2,
+        )
+

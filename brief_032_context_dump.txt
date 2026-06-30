@@ -1,0 +1,1073 @@
+===== api\routes\goals.py =====
+# PATH: stride_backend/api/routes/goals.py
+# DOMAIN: Goal creation and management API routes — Flow 1
+
+from __future__ import annotations
+
+import graphlib
+from datetime import date, datetime, timezone
+from math import floor
+from typing import Dict, List, Optional
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from agents.drafting_agent.agent import DraftingAgent
+from agents.smart_agent.agent import SmartAgent
+from agents.task_decomposer.agent import TaskDecomposer
+from api.dependencies import (
+    get_drafting_agent,
+    get_distilled_store,
+    get_goal_store,
+    get_onboarding_store,
+    get_raw_store,
+    get_scheduling_component,
+    get_smart_agent,
+    get_task_decomposer,
+)
+from core.config import (
+    DEEP_MIN_GAP_DAYS,
+    FLOOR_FACTOR,
+    SLOT_UNIT_CONSTANTS,
+    URGENCY_BRACKETS,
+)
+from core.scheduling.scheduling_component import SchedulingComponent
+from core.schemas.contracts.execution_engine import (
+    MilestoneAllocationData,
+    SlotAllocationInput,
+)
+from core.schemas.contracts.goal_drafting import (
+    DraftingInput,
+    DraftingOutput,
+    DraftingRevisionInput,
+)
+from core.schemas.contracts.goal_structuring import Boundary1Input
+from core.schemas.contracts.task_decomposition import TaskDecompositionInput
+from core.schemas.entities import (
+    Goal,
+    Milestone,
+    MilestoneStatus,
+    Task,
+    TaskStatus,
+)
+from core.schemas.enums import GoalStatus, TaskTag
+from storage.distilled_store import DistilledStore
+from storage.goal_store import GoalStore
+from storage.onboarding_store import OnboardingStore
+from storage.raw_store import RawStore
+
+router = APIRouter(prefix="/goals", tags=["goals"])
+
+
+# ── Request / Response models ──────────────────────────────────────────────────
+
+class DraftGoalRequest(BaseModel):
+    user_id: str
+    raw_goal: str
+    user_context: str
+
+
+class ReviseGoalDraftRequest(BaseModel):
+    user_id: str
+    previous_draft: dict
+    user_response: str
+
+
+class StructureGoalRequest(BaseModel):
+    user_id: str
+    confirmed_draft: dict
+    existing_goal_summaries: List[dict] = []
+
+
+class NegotiateStructureRequest(BaseModel):
+    user_id: str
+    confirmed_draft: dict
+    previous_assessment: dict
+    user_response: str
+    existing_goal_summaries: List[dict] = []
+
+
+class ConfirmGoalRequest(BaseModel):
+    user_id: str
+    confirmed_draft: dict
+    smart_assessment: dict          # Boundary1Output as dict
+    week_start: str                 # ISO date string
+
+
+# ── Tri-Vector helpers ─────────────────────────────────────────────────────────
+
+def _compute_urgency(deadline: date) -> float:
+    days_remaining = (deadline - date.today()).days
+    for threshold, multiplier in URGENCY_BRACKETS:
+        if days_remaining < threshold:
+            return multiplier
+    return 1.0
+
+
+def _compute_tri_vector_weights(
+    milestones: List[Milestone],
+    goal: Goal,
+    task_graphs: Dict[str, List[Task]],
+) -> Dict[str, float]:
+    """
+    Compute normalized tri_vector_weight for each milestone.
+    I = goal.macro_impact
+    U = urgency multiplier from terminal_deadline
+    V = slot units this milestone / avg slot units across all milestones
+    """
+    I = goal.macro_impact
+    U = _compute_urgency(goal.terminal_deadline)
+
+    # Compute raw slot units per milestone
+    slot_units: Dict[str, int] = {}
+    for m in milestones:
+        tasks = task_graphs.get(m.milestone_id, [])
+        total = sum(SLOT_UNIT_CONSTANTS.get(t.tag, 1) for t in tasks)
+        slot_units[m.milestone_id] = total if total > 0 else 1
+
+    avg_units = sum(slot_units.values()) / len(slot_units) if slot_units else 1.0
+
+    raw_weights: Dict[str, float] = {}
+    for m in milestones:
+        V = slot_units[m.milestone_id] / avg_units
+        raw_weights[m.milestone_id] = I * U * V
+
+    total = sum(raw_weights.values()) or 1.0
+    return {mid: w / total for mid, w in raw_weights.items()}
+
+
+def _derive_corridor(
+    normalized_weight: float,
+    max_workable_hours: float,
+) -> tuple[int, int]:
+    weekly_units = round(max_workable_hours * 2.4)
+    min_units = round(normalized_weight * weekly_units * FLOOR_FACTOR)
+    max_units = round(normalized_weight * weekly_units)
+    return max(min_units, 1), max(max_units, 1)
+
+
+def _resolve_dependencies(tasks: List[Task]) -> List[Task]:
+    """
+    Map dependency descriptions to task_ids using TopologicalSorter.
+    Returns tasks with dependencies resolved to task_ids.
+    Raises HTTPException 400 if cycle detected.
+    """
+    desc_to_id = {t.description: t.task_id for t in tasks}
+
+    # Build dependency map using task_ids
+    dep_map: Dict[str, List[str]] = {}
+    for task in tasks:
+        resolved = []
+        for dep_desc in task.dependencies:
+            dep_id = desc_to_id.get(dep_desc)
+            if dep_id:
+                resolved.append(dep_id)
+        dep_map[task.task_id] = resolved
+        task.dependencies = resolved
+
+    # Validate — detect cycles
+    try:
+        sorter = graphlib.TopologicalSorter(dep_map)
+        sorter.prepare()
+    except graphlib.CycleError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Dependency cycle detected in task graph: {e}",
+        )
+
+    # Mark tasks with no unmet deps as AVAILABLE
+    tasks_with_deps = {tid for deps in dep_map.values() for tid in deps}
+    for task in tasks:
+        if not task.dependencies:
+            task.status = TaskStatus.AVAILABLE
+        else:
+            task.status = TaskStatus.PENDING
+
+    return tasks
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+
+@router.post("/draft")
+async def draft_goal(
+    request: DraftGoalRequest,
+    drafting_agent: DraftingAgent = Depends(get_drafting_agent),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+):
+    """
+    Flow 1 Step 1 — DraftingAgent converts raw goal text into structured draft.
+    """
+    snapshot_result = distilled_store.get_model(request.user_id)
+    snapshot = snapshot_result.data.model_dump() if snapshot_result.success else {}
+
+    drafting_input = DraftingInput(
+        user_id=request.user_id,
+        raw_goal=request.raw_goal,
+        user_context=request.user_context,
+        distilled_model_snapshot=snapshot,
+    )
+
+    output = await drafting_agent.draft_goal(drafting_input)
+
+    if output.error:
+        raise HTTPException(status_code=500, detail=output.error.message)
+
+    return output.model_dump()
+
+
+@router.post("/draft/revise")
+async def revise_goal_draft(
+    request: ReviseGoalDraftRequest,
+    drafting_agent: DraftingAgent = Depends(get_drafting_agent),
+):
+    """
+    Flow 1 — DraftingAgent revises draft based on user feedback.
+    """
+    previous_draft = DraftingOutput(**request.previous_draft)
+
+    revision_input = DraftingRevisionInput(
+        user_id=request.user_id,
+        previous_draft=previous_draft,
+        user_response=request.user_response,
+    )
+
+    output = await drafting_agent.revise_draft(revision_input)
+
+    if output.error:
+        raise HTTPException(status_code=500, detail=output.error.message)
+
+    return output.model_dump()
+
+
+@router.post("/structure")
+async def structure_goal(
+    request: StructureGoalRequest,
+    smart_agent: SmartAgent = Depends(get_smart_agent),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+):
+    """
+    Flow 1 Step 2 — SmartAgent fits confirmed draft to user context.
+    Returns SMART formulation, impact_score, extracted_deadline.
+    """
+    snapshot_result = distilled_store.get_model(request.user_id)
+    snapshot = snapshot_result.data.model_dump() if snapshot_result.success else {}
+
+    boundary_input = Boundary1Input(
+        user_id=request.user_id,
+        confirmed_draft=request.confirmed_draft,
+        distilled_model_snapshot=snapshot,
+        existing_goal_summaries=request.existing_goal_summaries,
+    )
+
+    output = await smart_agent.structure_goal(boundary_input)
+
+    if output.error:
+        raise HTTPException(status_code=500, detail=output.error.message)
+
+    return output.model_dump()
+
+
+@router.post("/structure/negotiate")
+async def negotiate_goal_structure(
+    request: NegotiateStructureRequest,
+    smart_agent: SmartAgent = Depends(get_smart_agent),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+):
+    """
+    Flow 1 — SmartAgent negotiates SMART formulation on user pushback.
+    """
+    snapshot_result = distilled_store.get_model(request.user_id)
+    snapshot = snapshot_result.data.model_dump() if snapshot_result.success else {}
+
+    boundary_input = Boundary1Input(
+        user_id=request.user_id,
+        confirmed_draft=request.confirmed_draft,
+        distilled_model_snapshot=snapshot,
+        existing_goal_summaries=request.existing_goal_summaries,
+    )
+
+    output = await smart_agent.negotiate_goal_creation(
+        input=boundary_input,
+        previous_assessment=request.previous_assessment,
+        user_response=request.user_response,
+    )
+
+    if output.error:
+        raise HTTPException(status_code=500, detail=output.error.message)
+
+    return output.model_dump()
+
+
+@router.post("/confirm")
+async def confirm_goal(
+    request: ConfirmGoalRequest,
+    task_decomposer: TaskDecomposer = Depends(get_task_decomposer),
+    scheduling_component: SchedulingComponent = Depends(get_scheduling_component),
+    goal_store: GoalStore = Depends(get_goal_store),
+    raw_store: RawStore = Depends(get_raw_store),
+    distilled_store: DistilledStore = Depends(get_distilled_store),
+    onboarding_store: OnboardingStore = Depends(get_onboarding_store),
+):
+    """
+    Flow 1 Step 3 — Confirm goal. Writes Goal + Milestones, runs TaskDecomposer,
+    runs SchedulingComponent, writes Tasks.
+    """
+    smart = request.smart_assessment
+    draft = request.confirmed_draft
+
+    # ── Capacity conflict check ────────────────────────────────────────────────
+    onboarding_result = onboarding_store.get_profile(request.user_id)
+    if not onboarding_result.success:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No OnboardingProfile found for this user. "
+                "Complete onboarding (POST /onboarding/profile) before "
+                "confirming a goal."
+            ),
+        )
+    max_workable_hours = onboarding_result.data.max_workable_hours
+
+    # ── Build Goal entity ──────────────────────────────────────────────────────
+    extracted_deadline = smart.get("extracted_deadline")
+    if not extracted_deadline:
+        raise HTTPException(
+            status_code=400,
+            detail="extracted_deadline is required to confirm a goal.",
+        )
+
+    goal_id = str(uuid4())
+    goal = Goal(
+        goal_id=goal_id,
+        user_id=request.user_id,
+        name=smart.get("smart_formulation", {}).get("specific", "Unnamed Goal"),
+        status=GoalStatus.ACTIVE,
+        macro_impact=smart.get("impact_score", 3),
+        terminal_deadline=date.fromisoformat(extracted_deadline),
+    )
+
+    # ── Build Milestone entities (V=1.0 placeholder) ───────────────────────────
+    proposed_milestones = draft.get("proposed_milestones", [])
+    milestones: List[Milestone] = []
+    for pm in proposed_milestones:
+        milestones.append(Milestone(
+            milestone_id=str(uuid4()),
+            goal_id=goal_id,
+            user_id=request.user_id,
+            description=pm.get("description", ""),
+            objectives=pm.get("objectives", []),
+            success_metrics=draft.get("success_metrics", []),
+            tri_vector_weight=0.0,      # placeholder — computed after tasks
+            min_weekly_units=0,
+            max_weekly_units=0,
+            status=MilestoneStatus.STAGED,
+        ))
+
+    # ── Write Goal and Milestones ──────────────────────────────────────────────
+    goal_write = goal_store.upsert_goal(goal)
+    if not goal_write.success:
+        raise HTTPException(status_code=500, detail=goal_write.error.message)
+
+    for m in milestones:
+        m_write = goal_store.upsert_milestone(m)
+        if not m_write.success:
+            raise HTTPException(status_code=500, detail=m_write.error.message)
+
+    # ── Run TaskDecomposer per milestone ───────────────────────────────────────
+    task_graphs: Dict[str, List[Task]] = {}
+    for m in milestones:
+        decomp_input = TaskDecompositionInput(
+            milestone_id=m.milestone_id,
+            milestone_description=m.description,
+            objectives=m.objectives,
+            success_metrics=m.success_metrics,
+            previous_task_logs=[],
+        )
+        decomp_output = await task_decomposer.decompose(decomp_input)
+        if decomp_output.error:
+            raise HTTPException(
+                status_code=500, detail=decomp_output.error.message
+            )
+
+        # Build Task entities from drafts
+        tasks = [
+            Task(
+                task_id=str(uuid4()),
+                milestone_id=m.milestone_id,
+                goal_id=goal_id,
+                user_id=request.user_id,
+                description=td.description,
+                tag=td.tag,
+                dependencies=list(td.dependencies),
+                status=TaskStatus.PENDING,
+            )
+            for td in decomp_output.tasks
+        ]
+
+        # Resolve dependencies
+        tasks = _resolve_dependencies(tasks)
+        task_graphs[m.milestone_id] = tasks
+
+    # ── Recompute Tri-Vector with real V ───────────────────────────────────────
+    weights = _compute_tri_vector_weights(milestones, goal, task_graphs)
+
+    for m in milestones:
+        w = weights[m.milestone_id]
+        min_u, max_u = _derive_corridor(w, max_workable_hours)
+        m.tri_vector_weight = w
+        m.min_weekly_units = min_u
+        m.max_weekly_units = max_u
+        m.status = MilestoneStatus.ACTIVE
+        goal_store.upsert_milestone(m)
+
+    # ── Write Tasks ────────────────────────────────────────────────────────────
+    for task_list in task_graphs.values():
+        for task in task_list:
+            t_write = goal_store.upsert_task(task)
+            if not t_write.success:
+                raise HTTPException(
+                    status_code=500, detail=t_write.error.message
+                )
+
+    # ── Run SchedulingComponent ────────────────────────────────────────────────
+    week_start = date.fromisoformat(request.week_start)
+
+    slot_grid_result = onboarding_store.get_slot_grid(request.user_id, week_start)
+    if not slot_grid_result.success:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No SlotGrid found for user {request.user_id}, week "
+                f"{week_start.isoformat()}. Onboarding may be incomplete, "
+                f"or this week's grid has not been generated."
+            ),
+        )
+    slot_grid = slot_grid_result.data
+
+    allocation_input = SlotAllocationInput(
+        user_id=request.user_id,
+        week_start=week_start,
+        milestones=[
+            MilestoneAllocationData(
+                milestone_id=m.milestone_id,
+                tri_vector_weight=m.tri_vector_weight,
+                min_weekly_units=m.min_weekly_units,
+                max_weekly_units=m.max_weekly_units,
+            )
+            for m in milestones
+        ],
+        slot_grid=slot_grid.model_dump(),
+        notes="goal confirmation",
+    )
+
+    allocation_output = scheduling_component.allocate_slots(allocation_input)
+
+    if allocation_output.error:
+        # Non-fatal — log and continue. Scheduling failure should not
+        # block goal creation.
+        pass
+
+    return {
+        "goal_id": goal_id,
+        "milestone_ids": [m.milestone_id for m in milestones],
+        "task_counts": {
+            mid: len(tasks) for mid, tasks in task_graphs.items()
+        },
+        "deep_session_plans": (
+            [p.model_dump() for p in allocation_output.deep_session_plans]
+            if not allocation_output.error else []
+        ),
+        "status": "confirmed",
+    }
+
+
+===== storage\goal_store.py =====
+# PATH: stride_backend/storage/goal_store.py
+# DOMAIN: TinyDB persistence for Goals, Milestones, and Tasks.
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, date, timezone
+from enum import Enum
+from typing import Any, List
+
+from tinydb import TinyDB, Query
+
+from core.schemas.entities import Goal, Milestone, Task
+from core.schemas.enums import GoalStatus, MilestoneStatus, TaskStatus
+from storage.store_types import StoreError, StoreResult
+
+_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class GoalStore:
+    def __init__(self, db: TinyDB) -> None:
+        self._goals = db.table("goals")
+        self._milestones = db.table("milestones")
+        self._tasks = db.table("tasks")
+
+    def _serialise(self, data: Any) -> Any:
+        if isinstance(data, datetime):
+            return data.isoformat()
+        if isinstance(data, date):
+            return data.isoformat()
+        if isinstance(data, Enum):
+            return data.value
+        if isinstance(data, dict):
+            return {k: self._serialise(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._serialise(item) for item in data]
+        return data
+
+    def _deserialise(self, data: Any) -> Any:
+        if isinstance(data, str) and _ISO_RE.match(data):
+            try:
+                return datetime.fromisoformat(data)
+            except ValueError:
+                return data
+        if isinstance(data, str) and _DATE_RE.match(data):
+            try:
+                return date.fromisoformat(data)
+            except ValueError:
+                return data
+        if isinstance(data, dict):
+            return {k: self._deserialise(v) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._deserialise(item) for item in data]
+        return data
+
+    # ── Goal methods ───────────────────────────────────────────────────────────
+
+    def get_goal(self, user_id: str, goal_id: str) -> StoreResult[Goal]:
+        try:
+            Q = Query()
+            doc = self._goals.get(
+                (Q.goal_id == goal_id) & (Q.user_id == user_id)
+            )
+            if doc is None:
+                return StoreResult(
+                    success=False,
+                    error=StoreError(
+                        code="NOT_FOUND",
+                        message=f"No Goal with goal_id {goal_id} for user {user_id}",
+                        operation="get_goal",
+                    ),
+                )
+            goal = Goal(**self._deserialise(dict(doc)))
+            return StoreResult(success=True, data=goal)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR", message=str(e), operation="get_goal"
+                ),
+            )
+
+    def get_goals_by_user(self, user_id: str) -> StoreResult[List[Goal]]:
+        try:
+            Q = Query()
+            docs = self._goals.search(Q.user_id == user_id)
+            goals = [Goal(**self._deserialise(dict(doc))) for doc in docs]
+            return StoreResult(success=True, data=goals)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR", message=str(e), operation="get_goals_by_user"
+                ),
+            )
+
+    def get_active_goals(self, user_id: str) -> StoreResult[List[Goal]]:
+        try:
+            Q = Query()
+            docs = self._goals.search(
+                (Q.user_id == user_id) & (Q.status == GoalStatus.ACTIVE.value)
+            )
+            goals = [Goal(**self._deserialise(dict(doc))) for doc in docs]
+            return StoreResult(success=True, data=goals)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR", message=str(e), operation="get_active_goals"
+                ),
+            )
+
+    def upsert_goal(self, goal: Goal) -> StoreResult[None]:
+        try:
+            serialised = self._serialise(goal.model_dump())
+            Q = Query()
+            self._goals.upsert(serialised, Q.goal_id == goal.goal_id)
+            return StoreResult(success=True, data=None)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="WRITE_ERROR", message=str(e), operation="upsert_goal"
+                ),
+            )
+
+    def update_goal_status(
+        self, goal_id: str, user_id: str, new_status: GoalStatus, reason: str
+    ) -> StoreResult[None]:
+        if not reason:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="INVALID_INPUT",
+                    message="reason must not be empty",
+                    operation="update_goal_status",
+                ),
+            )
+        result = self.get_goal(user_id, goal_id)
+        if not result.success:
+            return result
+        goal = result.data
+        goal.status = new_status
+        return self.upsert_goal(goal)
+
+    # ── Milestone methods ──────────────────────────────────────────────────────
+
+    def get_milestones_by_goal(self, goal_id: str) -> StoreResult[List[Milestone]]:
+        try:
+            Q = Query()
+            docs = self._milestones.search(Q.goal_id == goal_id)
+            milestones = [
+                Milestone(**self._deserialise(dict(doc))) for doc in docs
+            ]
+            return StoreResult(success=True, data=milestones)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR",
+                    message=str(e),
+                    operation="get_milestones_by_goal",
+                ),
+            )
+
+    def get_active_milestones_by_user(
+        self, user_id: str
+    ) -> StoreResult[List[Milestone]]:
+        try:
+            Q = Query()
+            docs = self._milestones.search(
+                (Q.user_id == user_id)
+                & (Q.status == MilestoneStatus.ACTIVE.value)
+            )
+            milestones = [
+                Milestone(**self._deserialise(dict(doc))) for doc in docs
+            ]
+            return StoreResult(success=True, data=milestones)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR",
+                    message=str(e),
+                    operation="get_active_milestones_by_user",
+                ),
+            )
+
+    def upsert_milestone(self, milestone: Milestone) -> StoreResult[None]:
+        try:
+            serialised = self._serialise(milestone.model_dump())
+            Q = Query()
+            self._milestones.upsert(
+                serialised, Q.milestone_id == milestone.milestone_id
+            )
+            return StoreResult(success=True, data=None)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="WRITE_ERROR", message=str(e), operation="upsert_milestone"
+                ),
+            )
+
+    # ── Task methods ───────────────────────────────────────────────────────────
+
+    def get_task(self, task_id: str) -> StoreResult[Task]:
+        try:
+            Q = Query()
+            doc = self._tasks.get(Q.task_id == task_id)
+            if doc is None:
+                return StoreResult(
+                    success=False,
+                    error=StoreError(
+                        code="NOT_FOUND",
+                        message=f"No Task with task_id {task_id}",
+                        operation="get_task",
+                    ),
+                )
+            task = Task(**self._deserialise(dict(doc)))
+            return StoreResult(success=True, data=task)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR", message=str(e), operation="get_task"
+                ),
+            )
+
+    def get_tasks_by_milestone(
+        self, milestone_id: str
+    ) -> StoreResult[List[Task]]:
+        try:
+            Q = Query()
+            docs = self._tasks.search(Q.milestone_id == milestone_id)
+            tasks = [Task(**self._deserialise(dict(doc))) for doc in docs]
+            return StoreResult(success=True, data=tasks)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR",
+                    message=str(e),
+                    operation="get_tasks_by_milestone",
+                ),
+            )
+
+    def get_available_tasks_by_user(
+        self, user_id: str
+    ) -> StoreResult[List[Task]]:
+        """
+        Returns all AVAILABLE tasks for a user across all milestones.
+        Used by the API route to feed SlotAllocator.pull().
+        """
+        try:
+            Q = Query()
+            docs = self._tasks.search(
+                (Q.user_id == user_id)
+                & (Q.status == TaskStatus.AVAILABLE.value)
+            )
+            tasks = [Task(**self._deserialise(dict(doc))) for doc in docs]
+            return StoreResult(success=True, data=tasks)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR",
+                    message=str(e),
+                    operation="get_available_tasks_by_user",
+                ),
+            )
+
+    def upsert_task(self, task: Task) -> StoreResult[None]:
+        try:
+            serialised = self._serialise(task.model_dump())
+            Q = Query()
+            self._tasks.upsert(serialised, Q.task_id == task.task_id)
+            return StoreResult(success=True, data=None)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="WRITE_ERROR", message=str(e), operation="upsert_task"
+                ),
+            )
+
+    def update_task_status(
+        self, task_id: str, new_status: TaskStatus
+    ) -> StoreResult[None]:
+        result = self.get_task(task_id)
+        if not result.success:
+            return result
+        task = result.data
+        task.status = new_status
+        return self.upsert_task(task)
+
+    def get_tasks_by_user(self, user_id: str) -> StoreResult[List[Task]]:
+        try:
+            Q = Query()
+            docs = self._tasks.search(Q.user_id == user_id)
+            tasks = [Task(**self._deserialise(dict(doc))) for doc in docs]
+            return StoreResult(success=True, data=tasks)
+        except Exception as e:
+            return StoreResult(
+                success=False,
+                error=StoreError(
+                    code="READ_ERROR",
+                    message=str(e),
+                    operation="get_tasks_by_user",
+                ),
+            )
+
+
+===== core\schemas\entities.py =====
+from __future__ import annotations
+from datetime import date, datetime
+from typing import List, Optional
+from pydantic import BaseModel, Field, field_validator
+
+from core.schemas.enums import (
+    TaskTag, TaskStatus, MilestoneStatus, GoalStatus, EnergyLevel
+)
+
+
+# ─────────────────────────────────────────────
+# GOAL
+# ─────────────────────────────────────────────
+
+class Goal(BaseModel):
+    goal_id: str
+    user_id: str
+    name: str
+    status: GoalStatus = GoalStatus.ACTIVE
+    macro_impact: int               # 1–5, cascades to child milestones as I
+    terminal_deadline: date         # Python uses this to compute U
+    schema_version: int = 2
+
+
+# ─────────────────────────────────────────────
+# MILESTONE
+# ─────────────────────────────────────────────
+
+class Milestone(BaseModel):
+    milestone_id: str
+    goal_id: str
+    user_id: str
+    description: str
+    objectives: List[str] = Field(default_factory=list)
+    success_metrics: List[str] = Field(default_factory=list)
+    tri_vector_weight: float = 0.0          # computed by Python, not LLM
+    min_weekly_units: int = 0               # floor — derived from weight
+    max_weekly_units: int = 0               # ceiling — derived from weight
+    status: MilestoneStatus = MilestoneStatus.DRAFT
+    schema_version: int = 2
+
+
+# ─────────────────────────────────────────────
+# TASK
+# ─────────────────────────────────────────────
+
+class Task(BaseModel):
+    task_id: str
+    milestone_id: str
+    goal_id: str
+    user_id: str
+    description: str
+    tag: TaskTag
+    dependencies: List[str] = Field(default_factory=list)  # list of task_ids
+    status: TaskStatus = TaskStatus.PENDING
+    stalled_flag: bool = False
+    schema_version: int = 2
+
+    # NOTE: No slot_units field. Slot cost derived at runtime:
+    # MECHANICAL=1, MODERATE=2, DEEP=4 (from config.SLOT_UNIT_CONSTANTS)
+
+
+# ─────────────────────────────────────────────
+# SLOT GRID
+# ─────────────────────────────────────────────
+
+class TimeSlot(BaseModel):
+    day: str                        # e.g. "Monday"
+    start_time: str                 # e.g. "09:00"
+    energy_level: EnergyLevel
+
+
+class SlotGrid(BaseModel):
+    user_id: str
+    week_start: date
+    slots: List[TimeSlot] = Field(default_factory=list)
+    schema_version: int = 1
+
+    # NOTE: SlotGrid holds NO task IDs.
+    # It is an energy index — describes the user's week, not their schedule.
+
+
+# ─────────────────────────────────────────────
+# ONBOARDING PROFILE
+# ─────────────────────────────────────────────
+
+class EnergyBlock(BaseModel):
+    label: str                  # user-defined free text, e.g. "morning", "post-lunch slump"
+    start_time: str             # "HH:MM" 24hr format
+    end_time: str               # "HH:MM" 24hr format, must be > start_time
+    energy_level: EnergyLevel   # HIGH | MEDIUM | LOW
+
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def validate_time_format(cls, v: str) -> str:
+        import re
+        if not re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", v):
+            raise ValueError(f"Invalid HH:MM time format: {v}")
+        return v
+
+
+class OnboardingProfile(BaseModel):
+    user_id: str
+    max_workable_hours: float                   # hard weekly cap
+    weekday_blocks: List[EnergyBlock]            # applied Mon-Fri
+    weekend_blocks: List[EnergyBlock]            # applied Sat-Sun. Client sends
+                                                  # matching blocks for both if user
+                                                  # wants no weekday/weekend difference
+                                                  # — this is a user decision, not a
+                                                  # system default. Never silently
+                                                  # duplicated server-side.
+    schema_version: int = 3
+
+
+# ─────────────────────────────────────────────
+# RAW STORE ENTITIES
+# ─────────────────────────────────────────────
+
+class FeedbackEvent(BaseModel):
+    id: str
+    task_id: str
+    goal_id: str
+    milestone_id: str
+    user_id: str
+    completed_at: datetime
+    note: Optional[str] = None
+    significance_check_triggered: bool = False
+    schema_version: int = 1
+
+
+class PhaseTransition(BaseModel):
+    id: str
+    goal_id: str
+    user_id: str
+    from_status: str
+    to_status: str
+    transitioned_at: datetime
+    reason: str
+    schema_version: int = 1
+
+
+class RawUserModel(BaseModel):
+    user_id: str
+    feedback_events: List[FeedbackEvent] = Field(default_factory=list)
+    phase_transitions: List[PhaseTransition] = Field(default_factory=list)
+    last_updated: datetime
+    schema_version: int = 1
+
+
+# ─────────────────────────────────────────────
+# DISTILLED STORE ENTITIES
+# ─────────────────────────────────────────────
+
+class PriorityEntry(BaseModel):
+    goal_id: str
+    goal_name: str
+    weight: float                   # tri_vector_weight — used for ordering
+    schema_version: int = 1
+
+
+class PriorityList(BaseModel):
+    user_id: str
+    ranked_goals: List[PriorityEntry] = Field(default_factory=list)
+    last_updated: datetime
+    schema_version: int = 1
+
+
+class DistilledModel(BaseModel):
+    user_id: str
+    notes: Optional[str] = None     # free-form coaching notes from weekly guidance
+    distillation_version: int = 0   # incremented on each write
+    last_distilled_at: Optional[datetime] = None
+    schema_version: int = 1
+
+
+===== core\config.py =====
+# PATH: stride_backend/core/config.py
+# DOMAIN: Application configuration — loads environment variables and exposes a settings instance.
+
+from __future__ import annotations
+
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class Settings:
+    def __init__(self) -> None:
+        self.tinydb_raw_store_path: str = os.environ.get(
+            "TINYDB_RAW_STORE_PATH", "data/raw_store.json"
+        )
+        self.tinydb_distilled_store_path: str = os.environ.get(
+            "TINYDB_DISTILLED_STORE_PATH", "data/distilled_store.json"
+        )
+        self.tinydb_goal_store_path: str = os.environ.get(
+            "TINYDB_GOAL_STORE_PATH", "data/goal_store.json"
+        )
+        self.tinydb_onboarding_store_path: str = os.environ.get(
+            "TINYDB_ONBOARDING_STORE_PATH", "data/onboarding_store.json"
+        )
+        self.llm_provider: str = os.environ.get("LLM_PROVIDER", "openai")
+        self.llm_model: str = os.environ.get("LLM_MODEL", "gpt-4o")
+        self.llm_max_tokens: int = int(os.environ.get("LLM_MAX_TOKENS", "1000"))
+        self.openai_api_key: str = os.environ.get("OPENAI_API_KEY", "")
+        self.anthropic_api_key: str = os.environ.get("ANTHROPIC_API_KEY", "")
+
+    def get_llm(self):
+        if self.llm_provider == "openai":
+            from langchain_openai import ChatOpenAI
+            return ChatOpenAI(
+                model=self.llm_model,
+                max_tokens=self.llm_max_tokens,
+                api_key=self.openai_api_key,
+            )
+        if self.llm_provider == "anthropic":
+            from langchain_anthropic import ChatAnthropic
+            return ChatAnthropic(
+                model=self.llm_model,
+                max_tokens=self.llm_max_tokens,
+                api_key=self.anthropic_api_key,
+            )
+            
+        if self.llm_provider == "gemini":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            return ChatGoogleGenerativeAI(
+                model=self.llm_model,
+                google_api_key=os.environ.get("GOOGLE_API_KEY", ""),
+            )
+        raise ValueError(f"Unsupported LLM provider: {self.llm_provider!r}")
+
+
+settings = Settings()
+
+
+# ─────────────────────────────────────────────
+# SLOT CONSTANTS
+# ─────────────────────────────────────────────
+from core.schemas.enums import TaskTag
+
+SLOT_DURATION_MINUTES = 25          # base unit: 1 slot = 25 minutes
+
+SLOT_UNIT_CONSTANTS = {
+    TaskTag.MECHANICAL: 1,          # 25 minutes
+    TaskTag.MODERATE:   2,          # 50 minutes
+    TaskTag.DEEP:       4,          # 100 minutes
+}
+
+# ─────────────────────────────────────────────
+# EXECUTION ENGINE CONSTANTS
+# ─────────────────────────────────────────────
+MAX_CONSECUTIVE_PULLS   = 2         # before forced milestone rotation (MODERATE/MECHANICAL)
+DEEP_LOCKOUT_SENTINEL   = 99        # consecutive_pull_count sentinel that forces rotation
+STALL_THRESHOLD_DAYS    = 7         # days AVAILABLE before stalled_flag set on DEEP task
+FLOOR_FACTOR            = 0.6       # min_weekly = normalized_weight × weekly_units × FLOOR_FACTOR
+
+# ─────────────────────────────────────────────
+# SCHEDULING CONSTANTS
+# ─────────────────────────────────────────────
+DEEP_MIN_GAP_DAYS       = 2         # minimum days between DEEP sessions per milestone
+
+# ─────────────────────────────────────────────
+# TRI-VECTOR URGENCY BRACKETS
+# ─────────────────────────────────────────────
+URGENCY_BRACKETS = [
+    (7,  2.0),      # < 7 days remaining  → U = 2.0
+    (30, 1.5),      # < 30 days remaining → U = 1.5
+    (90, 1.2),      # < 90 days remaining → U = 1.2
+    (float('inf'), 1.0),    # >= 90 days → U = 1.0
+]
+
+
