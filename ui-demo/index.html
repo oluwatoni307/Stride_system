@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Stride — Throwaway UI</title>
+  <link rel="stylesheet" href="/ui/styles.css" />
+  <!-- Chart.js for weekly analytics -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div id="app">
+    <aside class="nav">
+      <h1>Stride Demo</h1>
+      <nav>
+        <button data-view="dashboard" class="nav-btn">Dashboard</button>
+        <button data-view="goals" class="nav-btn">Goals</button>
+        <button data-view="tasks" class="nav-btn">Tasks</button>
+        <button data-view="weekly" class="nav-btn">Weekly</button>
+        <button data-view="schedule" class="nav-btn">Schedule</button>
+        <button data-view="onboarding" class="nav-btn">Onboarding</button>
+        <button data-view="present" class="nav-btn">Presentation Mode</button>
+      </nav>
+      <div class="nav-footer">Serve from: <code>/ui</code></div>
+    </aside>
+n    <main class="content">
+      <section id="view-dashboard" class="view">
+        <h2>Quick Health</h2>
+        <div class="row">
+          <label>User ID <input id="user-id" value="demo-user" /></label>
+          <button id="btn-health">Check /health</button>
+        </div>
+        <pre id="health-result" class="result">(idle)</pre>
+n        <h3>Quick Actions</h3>
+        <div class="grid">
+          <button id="quick-draft">Draft sample goal</button>
+          <button id="quick-weekly">Run weekly cycle</button>
+          <button id="quick-pull">Pull task</button>
+        </div>
+n        <h3>Client log</h3>
+        <pre id="client-log" class="result">(no actions yet)</pre>
+      </section>
+n      <section id="view-goals" class="view hidden">
+        <h2>Goals</h2>
+        <div class="two-col">
+          <div>
+            <h3>Create / Draft</h3>
+            <label>User ID <input id="goal-user-id" value="demo-user" /></label>
+            <label>Raw goal <textarea id="raw-goal">Deliver a lightweight onboarding flow and measure conversion improvements.</textarea></label>
+            <div class="controls">
+              <button id="btn-draft-goal">Draft Goal</button>
+              <button id="btn-confirm-goal" disabled>Confirm Draft as Goal</button>
+            </div>
+            <h4>Draft output</h4>
+            <pre id="draft-output" class="result">(no draft)</pre>
+          </div>
+n          <div>
+            <h3>Recent Confirmations</h3>
+            <p>This throwaway UI keeps a transient list of confirmed goals for demo purposes.</p>
+            <ul id="confirmed-goals" class="list"></ul>
+          </div>
+        </div>
+      </section>
+n      <section id="view-tasks" class="view hidden">
+        <h2>Tasks</h2>
+        <div class="row">
+          <label>User ID <input id="task-user-id" value="demo-user" /></label>
+          <label>Energy
+            <select id="energy">
+              <option>HIGH</option>
+              <option selected>MEDIUM</option>
+              <option>LOW</option>
+            </select>
+          </label>
+          <div class="controls">
+            <button id="btn-pull">Pull Task</button>
+            <button id="btn-complete" disabled>Complete Last Pulled Task</button>
+          </div>
+        </div>
+        <h4>Pulled task</h4>
+        <pre id="pulled-task" class="result">(no task)</pre>
+n        <h4>Task history (transient)</h4>
+        <ul id="task-history" class="list"></ul>
+      </section>
+n      <section id="view-weekly" class="view hidden">
+        <h2>Weekly analytics</h2>
+        <div class="row">
+          <label>User ID <input id="weekly-user-id" value="demo-user" /></label>
+          <label>Week start <input id="week-start" placeholder="YYYY-MM-DD" /></label>
+          <button id="btn-weekly">Run weekly/cycle</button>
+        </div>
+        <div class="charts">
+          <canvas id="milestone-chart" height="160"></canvas>
+        </div>
+        <pre id="weekly-result" class="result">(no data)</pre>
+      </section>
+n      <section id="view-schedule" class="view hidden">
+        <h2>Schedule / Slot Allocation</h2>
+        <div class="row">
+          <label>User ID <input id="schedule-user-id" value="demo-user" /></label>
+          <label>Week start <input id="schedule-week" placeholder="YYYY-MM-DD"/></label>
+        </div>
+        <h4>Slot grid (editable JSON)</h4>
+        <textarea id="slot-grid" class="large">{"monday": ["08:00-10:00"], "tuesday": [], "wednesday": ["14:00-16:00"], "thursday": [], "friday": [], "saturday": [], "sunday": []}</textarea>
+        <div class="controls">
+          <button id="btn-allocate">Allocate Slots</button>
+        </div>
+        <h4>Allocation result</h4>
+        <pre id="allocate-result" class="result">(no allocation yet)</pre>
+      </section>
+n      <section id="view-onboarding" class="view hidden">
+        <h2>Onboarding / Profile</h2>
+        <div class="two-col">
+          <div>
+            <label>User ID <input id="onboard-user-id" value="demo-user" /></label>
+            <label>Timezone <input id="onboard-timezone" value="UTC"/></label>
+            <label>Max workable hours <input id="onboard-hours" type="number" value="20"/></label>
+            <div class="controls">
+              <button id="btn-create-profile">Create / Update Profile</button>
+              <button id="btn-get-profile">Get Profile</button>
+            </div>
+          </div>
+          <div>
+            <h4>Profile data</h4>
+            <pre id="onboarding-result" class="result">(no profile)</pre>
+          </div>
+        </div>
+      </section>
+n      <section id="view-present" class="view hidden">
+        <h2>Presentation / Demo Mode</h2>
+        <p>Use this mode to step through a narrated demo sequence. Presenter notes and highlights appear as steps run.</p>
+        <div>
+          <label>User ID <input id="present-user-id" value="demo-user" /></label>
+          <div class="controls">
+            <button id="btn-start-presentation">Start Presentation</button>
+            <button id="btn-stop-presentation" disabled>Stop</button>
+          </div>
+        </div>
+        <div class="present-area">
+          <div id="present-narration" class="result">(presentation idle)</div>
+          <pre id="present-log" class="result">(no steps yet)</pre>
+        </div>
+      </section>
+n    </main>
+  </div>
+
+  <script src="/ui/app.js"></script>
+</body>
+</html>
